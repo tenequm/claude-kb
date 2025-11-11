@@ -7,21 +7,30 @@ import sys
 from pathlib import Path
 
 import click
+import torch
 from dotenv import load_dotenv
 from qdrant_client import models
 from rich.console import Console
 
+from . import __version__
 from .core import AsyncQdrantDB, QdrantDB, format_get_result, format_search_results
 from .import_claude import import_conversations_async
 
 # Load environment variables
 load_dotenv()
 
+# Enable MPS fallback for Apple Silicon (must be before any torch operations)
+if torch.backends.mps.is_available():
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    logging.getLogger(__name__).debug("MPS detected: Enabled CPU fallback for unsupported ops")
+
 # Configuration
 CONFIG = {
     "qdrant_url": os.getenv("QDRANT_URL", "http://localhost:6333"),
     "qdrant_api_key": os.getenv("QDRANT_API_KEY"),
     "embedding_model": os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5"),
+    "hf_token": os.getenv("HF_TOKEN"),  # For HF Inference API (faster than local)
+    "use_hf_api": os.getenv("USE_HF_API", "false").lower() == "true",
 }
 
 console = Console()
@@ -42,8 +51,8 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 # =============================================================================
 
 
-@click.group()
-@click.version_option(version="0.1.0")
+@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.version_option(version=__version__)
 def main():
     """Claude KB - Universal Knowledge Base CLI."""
     pass
@@ -79,11 +88,6 @@ kb import-claude-code-chats --project /path --dry-run
 out: ✓ Imported N conversations, M messages (duration)
 exit: 0=ok 1=invalid_path 2=error
 
-# init - Initialize Qdrant collections
-kb init
-out: ✓ Connected to Qdrant\\n✓ Created conversations, entities, documents
-exit: 0=ok 2=qdrant_error
-
 # status - Database statistics
 kb status
 out: Collections:\\n  conversations    N points\\n  entities         N points
@@ -95,46 +99,6 @@ out: <this-format>
 exit: 0
 """
     console.print(schema)
-
-
-# =============================================================================
-# INIT COMMAND
-# =============================================================================
-
-
-@main.command()
-def init():
-    """Initialize Qdrant collections."""
-    try:
-        console.print("[bold cyan]=== Initializing Claude KB ===[/]")
-        console.print()
-
-        # Connect to Qdrant
-        console.print("Connecting to Qdrant...", end=" ")
-        db = QdrantDB(CONFIG["qdrant_url"], CONFIG["qdrant_api_key"], CONFIG["embedding_model"])
-        console.print("[green]✓[/]")
-
-        # Create collections
-        console.print("Creating collections...", end=" ")
-        db.init_collections()
-        console.print("[green]✓[/]")
-
-        console.print()
-        console.print("[bold green]Configuration:[/]")
-        console.print(f"  Qdrant URL: {CONFIG['qdrant_url']}")
-        console.print(f"  Embedding Model: {CONFIG['embedding_model']} (FastEmbed/ONNX)")
-        console.print("  Vector Dimensions: 768")
-
-        console.print()
-        console.print("[bold green]✓ Ready to use![/]")
-        console.print()
-        console.print("Try:")
-        console.print("  kb import-claude-code-chats")
-        console.print('  kb search "your query"')
-
-    except Exception as e:
-        console.print(f"[red]✗ Error: {e}[/]")
-        sys.exit(2)
 
 
 # =============================================================================
@@ -208,21 +172,35 @@ def import_claude_code_chats(project, session_file, include_meta, dry_run):
 def search(query, collection, limit, stream, filter):
     """Hybrid semantic+keyword search."""
     try:
+        # TODO: Implement streaming mode for background execution
         if stream:
-            console.print(
-                "[yellow]Note: Streaming mode not yet implemented. Using blocking mode.[/]",
-                file=sys.stderr,
+            raise NotImplementedError(
+                "Streaming mode not yet implemented. Remove --stream flag to use blocking mode."
             )
 
         # Initialize
         db = QdrantDB(CONFIG["qdrant_url"], CONFIG["qdrant_api_key"], CONFIG["embedding_model"])
 
-        # Search using QdrantClient's built-in query with FastEmbed
-        results = db.client.query_points(
-            collection_name=collection,
-            query=models.Document(text=query, model=db.embedding_model),
-            limit=limit,
-        ).points
+        # Load embedding model and encode query
+        db.embedding_model.load()
+        query_vector = db.embedding_model.encode([query], batch_size=1, show_progress=False)[0]
+
+        # Detect vector configuration (named vs default)
+        collection_info = db.client.get_collection(collection)
+        vector_names = list(collection_info.config.params.vectors.keys())
+
+        # Search using pre-computed query embedding
+        search_params = {
+            "collection_name": collection,
+            "query_vector": query_vector.tolist(),
+            "limit": limit,
+        }
+
+        # If collection has named vectors, specify which one to use
+        if vector_names:
+            search_params["vector_name"] = vector_names[0]
+
+        results = db.client.search(**search_params)
 
         # Format and output
         if not results:
@@ -262,16 +240,14 @@ def get(item_id, context_window, collection):
             console.print(f"Not found: {item_id}")
             sys.exit(1)
 
-        # Format and output
-        output = format_get_result(point, collection)
-
+        # TODO: Implement token-aware truncation for context window
         if context_window:
-            # TODO: Implement token-aware truncation
-            console.print(
-                "[yellow]Note: --context-window not yet implemented[/]",
-                file=sys.stderr,
+            raise NotImplementedError(
+                "Context window truncation not yet implemented. Remove --context-window flag."
             )
 
+        # Format and output
+        output = format_get_result(point, collection)
         console.print(output)
 
     except Exception as e:

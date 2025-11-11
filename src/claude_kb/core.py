@@ -1,12 +1,104 @@
-"""Core backend: Qdrant client with built-in FastEmbed."""
+"""Core backend: Qdrant client with sentence-transformers on MPS."""
 
 import hashlib
 import logging
 
+import numpy as np
 from qdrant_client import AsyncQdrantClient, QdrantClient
-from qdrant_client.models import Distance, VectorParams
+from qdrant_client.models import PointStruct
+from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+# Collection names
+COLLECTION_CONVERSATIONS = "conversations"
+COLLECTION_ENTITIES = "entities"
+COLLECTION_DOCUMENTS = "documents"
+
+# Content truncation
+MAX_CONTENT_PREVIEW_LENGTH = 500  # Characters to show in search results
+
+# Size estimation
+ESTIMATED_KB_PER_POINT = 1  # Rough estimate for 768-dim vector + metadata
+
+
+# =============================================================================
+# EMBEDDING MODEL
+# =============================================================================
+
+
+class EmbeddingModel:
+    """Sentence-transformers wrapper with MPS support for fast embeddings."""
+
+    def __init__(self, model_name: str, device: str | None = None):
+        """
+        Initialize embedding model.
+
+        Args:
+            model_name: HuggingFace model name
+            device: Device to use (None = auto-detect: CUDA > MPS > CPU)
+        """
+        self.model_name = model_name
+        self._model: SentenceTransformer | None = None
+        self._device = device
+
+    def load(self) -> None:
+        """Load the model (lazy loading on first use)."""
+        if self._model is not None:
+            return
+
+        # Suppress sentence-transformers logging during model load
+        import logging as std_logging
+
+        st_logger = std_logging.getLogger("sentence_transformers")
+        original_level = st_logger.level
+        st_logger.setLevel(std_logging.WARNING)
+
+        logger.info(f"Loading embedding model: {self.model_name}")
+        self._model = SentenceTransformer(
+            self.model_name, trust_remote_code=True, device=self._device
+        )
+
+        # Restore logging level
+        st_logger.setLevel(original_level)
+
+        device_str = str(self._model.device).lower()
+        if "mps" in device_str:
+            logger.info("✓ Using Apple Silicon GPU (MPS)")
+        elif "cuda" in device_str:
+            logger.info("✓ Using NVIDIA GPU (CUDA)")
+        else:
+            logger.info(f"Using CPU: {device_str}")
+
+    def encode(
+        self, texts: list[str], batch_size: int = 100, show_progress: bool = False
+    ) -> np.ndarray:
+        """
+        Generate embeddings for texts.
+
+        Args:
+            texts: List of text strings
+            batch_size: Batch size for encoding
+            show_progress: Show progress bar
+
+        Returns:
+            numpy array of embeddings (len(texts), embedding_dim)
+        """
+        if self._model is None:
+            self.load()
+
+        return self._model.encode(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=show_progress,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
 
 
 # =============================================================================
@@ -15,25 +107,26 @@ logger = logging.getLogger(__name__)
 
 
 class QdrantDB:
-    """Qdrant vector database wrapper with built-in FastEmbed."""
+    """Qdrant vector database wrapper with sentence-transformers."""
 
     def __init__(
         self,
         url: str,
-        api_key: str | None = None,
-        embedding_model: str = "BAAI/bge-base-en-v1.5",
+        api_key: str | None,
+        embedding_model: str,
     ):
         """
-        Initialize Qdrant client with FastEmbed.
+        Initialize Qdrant client with sentence-transformers.
 
         Args:
             url: Qdrant server URL (e.g., http://localhost:6333)
             api_key: Optional API key for Qdrant Cloud
-            embedding_model: FastEmbed model name (default: bge-base-en-v1.5)
+            embedding_model: Model name (from config)
         """
         self.client = QdrantClient(url=url, api_key=api_key)
         self.url = url
-        self.embedding_model = embedding_model
+        self.embedding_model_name = embedding_model
+        self.embedding_model = EmbeddingModel(embedding_model)
         logger.info(f"Using embedding model: {embedding_model}")
 
     def init_collections(self) -> None:
@@ -53,7 +146,7 @@ class QdrantDB:
             logger.error(f"Failed to connect to Qdrant: {e}")
             raise
 
-    def get_by_id(self, collection: str, point_id: str):
+    def get_by_id(self, collection: str, point_id: str) -> PointStruct | None:
         """
         Retrieve single point by ID.
 
@@ -85,7 +178,9 @@ class QdrantDB:
             logger.error(f"Failed to get stats: {e}")
             return {}
 
-    def get_project_stats(self, collection: str = "conversations") -> list[dict]:
+    def get_project_stats(
+        self, collection: str = COLLECTION_CONVERSATIONS
+    ) -> list[dict[str, int | str]]:
         """
         Get per-project statistics (sessions and messages).
 
@@ -148,25 +243,26 @@ class QdrantDB:
 
 
 class AsyncQdrantDB:
-    """Async Qdrant vector database wrapper with built-in FastEmbed."""
+    """Async Qdrant vector database wrapper with sentence-transformers."""
 
     def __init__(
         self,
         url: str,
-        api_key: str | None = None,
-        embedding_model: str = "BAAI/bge-base-en-v1.5",
+        api_key: str | None,
+        embedding_model: str,
     ):
         """
-        Initialize Async Qdrant client with FastEmbed.
+        Initialize Async Qdrant client with sentence-transformers.
 
         Args:
             url: Qdrant server URL (e.g., http://localhost:6333)
             api_key: Optional API key for Qdrant Cloud
-            embedding_model: FastEmbed model name (default: bge-base-en-v1.5)
+            embedding_model: Model name (from config)
         """
         self.client = AsyncQdrantClient(url=url, api_key=api_key)
         self.url = url
-        self.embedding_model = embedding_model
+        self.embedding_model_name = embedding_model
+        self.embedding_model = EmbeddingModel(embedding_model)
         logger.info(f"Using async embedding model: {embedding_model}")
 
     async def init_collections(self) -> None:
@@ -233,27 +329,31 @@ def format_search_results(results, collection: str) -> str:
 
         lines = [f"=== {point_id} (score: {score:.2f}) ==="]
 
-        if collection == "conversations":
+        if collection == COLLECTION_CONVERSATIONS:
             lines.append(f"Role: {payload.get('role', 'unknown')}")
             lines.append(f"Time: {payload.get('timestamp', 'N/A')}")
             lines.append(f"Project: {payload.get('project_path', 'N/A')}")
             lines.append("")
             content = payload.get("content", "")
             # Truncate long content
-            if len(content) > 500:
-                lines.append(content[:500] + "...")
+            if len(content) > MAX_CONTENT_PREVIEW_LENGTH:
+                lines.append(content[:MAX_CONTENT_PREVIEW_LENGTH] + "...")
             else:
                 lines.append(content)
 
-        elif collection == "entities":
+        elif collection == COLLECTION_ENTITIES:
             lines.append(f"Type: {payload.get('type', 'unknown')}")
             lines.append(f"Name: {payload.get('name', 'N/A')}")
             description = payload.get("description", "")
             if description:
                 lines.append("")
-                lines.append(description[:500] + "..." if len(description) > 500 else description)
+                lines.append(
+                    description[:MAX_CONTENT_PREVIEW_LENGTH] + "..."
+                    if len(description) > MAX_CONTENT_PREVIEW_LENGTH
+                    else description
+                )
 
-        elif collection == "documents":
+        elif collection == COLLECTION_DOCUMENTS:
             lines.append(f"Title: {payload.get('title', 'N/A')}")
             lines.append(f"Source: {payload.get('source', 'N/A')}")
             tags = payload.get("tags", [])
@@ -261,7 +361,11 @@ def format_search_results(results, collection: str) -> str:
                 lines.append(f"Tags: {', '.join(tags)}")
             lines.append("")
             content = payload.get("content", "")
-            lines.append(content[:500] + "..." if len(content) > 500 else content)
+            lines.append(
+                content[:MAX_CONTENT_PREVIEW_LENGTH] + "..."
+                if len(content) > MAX_CONTENT_PREVIEW_LENGTH
+                else content
+            )
 
         else:
             # Generic format

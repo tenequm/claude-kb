@@ -272,7 +272,7 @@ async def get_existing_message_ids_async(async_db, collection: str) -> set[str]:
 
 
 async def _upload_batch_async(
-    client, collection: str, batch_messages: list[dict], embedding_model: str
+    client, collection: str, batch_messages: list[dict], embedding_model
 ) -> int:
     """
     Upload a batch of messages to Qdrant asynchronously.
@@ -281,7 +281,7 @@ async def _upload_batch_async(
         client: AsyncQdrantClient instance
         collection: Collection name
         batch_messages: List of message dicts to upload
-        embedding_model: Embedding model name
+        embedding_model: EmbeddingModel instance
 
     Returns:
         Number of messages uploaded
@@ -319,14 +319,18 @@ async def _upload_batch_async(
             }
         )
 
-    # Upload batch (client.add embeds automatically)
-    # Note: Qdrant will skip duplicates based on IDs
-    await client.add(
-        collection_name=collection,
-        documents=batch_documents,
-        metadata=batch_payloads,
-        ids=batch_ids,
-    )
+    # Generate embeddings using sentence-transformers (MPS-accelerated)
+    embeddings = embedding_model.encode(batch_documents, batch_size=100, show_progress=False)
+
+    # Upload batch with pre-computed embeddings
+    points = [
+        models.PointStruct(
+            id=batch_ids[i], vector=embeddings[i].tolist(), payload=batch_payloads[i]
+        )
+        for i in range(len(batch_ids))
+    ]
+
+    await client.upsert(collection_name=collection, points=points)
 
     return len(batch_messages)
 
@@ -457,6 +461,20 @@ async def import_conversations_async(
     if not new_messages:
         console.print("\n[green]✓ All messages already imported (no new content)[/green]\n")
         return stats
+
+    # Ensure collection exists (auto-create if needed)
+    try:
+        await async_db.client.get_collection("conversations")
+    except Exception:
+        # Collection doesn't exist, create it
+        console.print("[yellow]Creating conversations collection...[/yellow]")
+        from qdrant_client.models import Distance, VectorParams
+
+        await async_db.client.create_collection(
+            collection_name="conversations",
+            vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+        )
+        console.print("[green]✓ Collection created[/green]")
 
     console.print(f"\n[cyan]📥 Importing {len(new_messages):,} new messages...[/cyan]")
 
