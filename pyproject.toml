@@ -1,0 +1,89 @@
+[project]
+name = "claude-kb"
+version = "0.1.0"
+description = "Universal knowledge base with Qdrant for Claude Code integration"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "qdrant-client>=1.11.0",
+    "fastembed>=0.2.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.7.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[project.scripts]
+kb = "claude_kb.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# =============================================================================
+# RUFF: Loose, Helpful Rules (No Christmas Tree!)
+# =============================================================================
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+# Only check what actually helps catch bugs
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors (syntax issues that break code)
+    "F",   # pyflakes (undefined vars, unused imports - actual bugs!)
+    "I",   # isort (import sorting - keeps it clean)
+    "UP",  # pyupgrade (use modern Python syntax)
+]
+
+# Ignore the annoying stuff that doesn't break code
+ignore = [
+    "E501",   # Line too long - we have line-length, formatter handles it
+    "E741",   # Ambiguous variable name (l, O, I) - sometimes makes sense
+    "F401",   # Unused import - sometimes we import for __all__ or re-exports
+    "F841",   # Unused variable - sometimes you're debugging or it's intentional
+    "UP007",  # Use X | Y for unions - Optional[X] is fine and more readable
+    "UP006",  # Use type instead of Type - both are valid
+]
+
+# Don't check these paths
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "*.egg-info",
+]
+
+[tool.ruff.format]
+# Use double quotes
+quote-style = "double"
+
+# Indent with spaces
+indent-style = "space"
+
+# Unix line endings
+line-ending = "lf"
+
+# =============================================================================
+# PYTEST
+# =============================================================================
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "-ra",  # Show extra test summary info
+]
