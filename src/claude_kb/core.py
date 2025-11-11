@@ -5,7 +5,7 @@ import logging
 
 import numpy as np
 from qdrant_client import AsyncQdrantClient, QdrantClient
-from qdrant_client.models import PointStruct
+from qdrant_client.models import Filter, PointStruct
 from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
@@ -127,7 +127,7 @@ class QdrantDB:
         self.url = url
         self.embedding_model_name = embedding_model
         self.embedding_model = EmbeddingModel(embedding_model)
-        logger.info(f"Using embedding model: {embedding_model}")
+        logger.debug(f"Using embedding model: {embedding_model}")
 
     def init_collections(self) -> None:
         """
@@ -159,6 +159,55 @@ class QdrantDB:
         """
         results = self.client.retrieve(collection_name=collection, ids=[point_id])
         return results[0] if results else None
+
+    def search(
+        self,
+        query_vector: list[float],
+        collection: str,
+        limit: int = 10,
+        query_filter: Filter | None = None,
+    ) -> list:
+        """
+        Search collection with optional metadata filtering.
+
+        Args:
+            query_vector: Query embedding vector
+            collection: Collection name
+            limit: Maximum number of results
+            query_filter: Optional Qdrant Filter for metadata filtering
+
+        Returns:
+            List of search results (ScoredPoint objects)
+        """
+        from qdrant_client import models
+
+        # Detect vector configuration (named vs default)
+        collection_info = self.client.get_collection(collection)
+        vectors = collection_info.config.params.vectors
+
+        # Check if vectors is a dict (named vectors) or VectorParams (single default vector)
+        if isinstance(vectors, dict):
+            vector_names = list(vectors.keys())
+        else:
+            # Single unnamed vector - use default behavior
+            vector_names = []
+
+        # Build search parameters
+        search_params = {
+            "collection_name": collection,
+            "query_vector": query_vector,
+            "limit": limit,
+        }
+
+        # Add filter if provided
+        if query_filter:
+            search_params["query_filter"] = query_filter
+
+        # If collection has named vectors, specify which one to use
+        if vector_names:
+            search_params["vector_name"] = vector_names[0]
+
+        return self.client.search(**search_params)
 
     def get_thread_context(
         self, collection: str, message_id: str, depth: int = 2
@@ -341,7 +390,7 @@ class AsyncQdrantDB:
         self.url = url
         self.embedding_model_name = embedding_model
         self.embedding_model = EmbeddingModel(embedding_model)
-        logger.info(f"Using async embedding model: {embedding_model}")
+        logger.debug(f"Using async embedding model: {embedding_model}")
 
     async def init_collections(self) -> None:
         """
@@ -407,7 +456,7 @@ def clean_content(content: str | list | dict) -> str | list | dict:
     return content
 
 
-def format_search_results(results, collection: str) -> str:
+def format_search_results(results, collection: str, show_tokens: bool = False) -> str:
     """
     Format search results as structured text for LLM parsing.
 
@@ -422,6 +471,7 @@ def format_search_results(results, collection: str) -> str:
     Args:
         results: List of QueryResponse objects from client.query()
         collection: Collection name
+        show_tokens: Whether to display token counts
 
     Returns:
         Formatted string
@@ -430,6 +480,7 @@ def format_search_results(results, collection: str) -> str:
         return "No results found."
 
     output = []
+    total_tokens = 0
 
     for result in results:
         # Handle both QueryResponse (from client.query) and ScoredPoint (from client.search)
@@ -448,10 +499,19 @@ def format_search_results(results, collection: str) -> str:
             lines.append(f"Role: {payload.get('role', 'unknown')}")
             lines.append(f"Time: {payload.get('timestamp', 'N/A')}")
             lines.append(f"Project: {payload.get('project_path', 'N/A')}")
-            lines.append("")
+
             # Clean signatures from content
             content = clean_content(payload.get("content", ""))
             content = str(content) if not isinstance(content, str) else content
+
+            # Count tokens if requested
+            if show_tokens:
+                token_count = count_tokens(content)
+                total_tokens += token_count
+                lines.append(f"Tokens: {token_count:,}")
+
+            lines.append("")
+
             # Truncate long content
             if len(content) > MAX_CONTENT_PREVIEW_LENGTH:
                 lines.append(content[:MAX_CONTENT_PREVIEW_LENGTH] + "...")
@@ -490,6 +550,10 @@ def format_search_results(results, collection: str) -> str:
 
         lines.append("---")
         output.append("\n".join(lines))
+
+    # Add total token count if requested
+    if show_tokens and total_tokens > 0:
+        output.append(f"\n=== Total: {len(results)} results, {total_tokens:,} tokens ===")
 
     return "\n".join(output)
 
@@ -628,6 +692,27 @@ def format_get_result(point, collection: str) -> str:
 # =============================================================================
 # UTILITIES
 # =============================================================================
+
+
+def count_tokens(text: str) -> int:
+    """
+    Count tokens using tiktoken cl100k_base encoding (GPT-4/Claude compatible).
+
+    Args:
+        text: Text to count tokens for
+
+    Returns:
+        Number of tokens
+    """
+    import tiktoken
+
+    try:
+        encoding = tiktoken.get_encoding("cl100k_base")
+        return len(encoding.encode(text))
+    except Exception as e:
+        logger.warning(f"Failed to count tokens: {e}")
+        # Fallback: rough estimate (4 chars per token)
+        return len(text) // 4
 
 
 def generate_id(content: str, type_prefix: str) -> str:

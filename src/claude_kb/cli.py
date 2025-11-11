@@ -218,16 +218,30 @@ def import_claude_code_chats(project, session_file, include_meta, dry_run):
 @click.option("--collection", "-c", default="conversations", help="Collection to search")
 @click.option("--limit", "-l", default=10, help="Max results")
 @click.option("--stream", "-s", is_flag=True, help="Stream results (background mode)")
-@click.option("--filter", "-f", multiple=True, help="Metadata filters (key:value)")
-def search(query, collection, limit, stream, filter):
-    """Hybrid semantic+keyword search."""
+@click.option("--project", "-p", help="Filter by project path (partial match)")
+@click.option("--from", "from_date", help="Filter by date from (ISO format: YYYY-MM-DD)")
+@click.option("--to", "to_date", help="Filter by date to (ISO format: YYYY-MM-DD)")
+@click.option("--conversation", help="Filter by conversation ID (exact match)")
+@click.option(
+    "--role",
+    type=click.Choice(["user", "assistant"], case_sensitive=False),
+    help="Filter by message role",
+)
+@click.option("--show-tokens", is_flag=True, help="Display token counts for each result")
+def search(
+    query,
+    collection,
+    limit,
+    stream,
+    project,
+    from_date,
+    to_date,
+    conversation,
+    role,
+    show_tokens,
+):
+    """Semantic search with optional metadata filtering."""
     try:
-        # TODO: Implement streaming mode for background execution
-        if stream:
-            raise NotImplementedError(
-                "Streaming mode not yet implemented. Remove --stream flag to use blocking mode."
-            )
-
         # Suppress INFO logs from core module (model loading messages)
         logging.getLogger("claude_kb.core").setLevel(logging.WARNING)
 
@@ -238,37 +252,116 @@ def search(query, collection, limit, stream, filter):
         db.embedding_model.load()
         query_vector = db.embedding_model.encode([query], batch_size=1, show_progress=False)[0]
 
-        # Detect vector configuration (named vs default)
-        collection_info = db.client.get_collection(collection)
-        vectors = collection_info.config.params.vectors
+        # Build Qdrant filter from CLI flags (server-side filtering)
+        query_filter = None
+        filter_conditions = []
 
-        # Check if vectors is a dict (named vectors) or VectorParams (single default vector)
-        if isinstance(vectors, dict):
-            vector_names = list(vectors.keys())
-        else:
-            # Single unnamed vector - use default behavior (don't specify vector_name)
-            vector_names = []
+        if project or conversation or role:
+            from qdrant_client.models import FieldCondition, Filter, MatchText, MatchValue
 
-        # Search using pre-computed query embedding
-        search_params = {
-            "collection_name": collection,
-            "query_vector": query_vector.tolist(),
-            "limit": limit,
-        }
+            # Project filter (partial match using MatchText)
+            if project:
+                filter_conditions.append(
+                    FieldCondition(key="project_path", match=MatchText(text=project))
+                )
 
-        # If collection has named vectors, specify which one to use
-        if vector_names:
-            search_params["vector_name"] = vector_names[0]
+            # Conversation ID filter (exact match)
+            if conversation:
+                filter_conditions.append(
+                    FieldCondition(key="conversation_id", match=MatchValue(value=conversation))
+                )
 
-        results = db.client.search(**search_params)
+            # Role filter (exact match)
+            if role:
+                filter_conditions.append(
+                    FieldCondition(key="role", match=MatchValue(value=role.lower()))
+                )
+
+            # Combine all conditions with AND logic
+            if filter_conditions:
+                query_filter = Filter(must=filter_conditions)
+
+        # Search using the new db.search() method (fetch more if date filtering)
+        search_limit = limit * 3 if (from_date or to_date) else limit
+        results = db.search(
+            query_vector=query_vector.tolist(),
+            collection=collection,
+            limit=search_limit,
+            query_filter=query_filter,
+        )
+
+        # Client-side date filtering (since timestamps are ISO strings, not numbers)
+        if from_date or to_date:
+            filtered_results = []
+            from_ts = f"{from_date}T00:00:00" if from_date else None
+            to_ts = f"{to_date}T23:59:59" if to_date else None
+
+            for result in results:
+                timestamp = result.payload.get("timestamp", "")
+                if from_ts and timestamp < from_ts:
+                    continue
+                if to_ts and timestamp > to_ts:
+                    continue
+                filtered_results.append(result)
+
+            results = filtered_results[:limit]
 
         # Format and output
         if not results:
             console.print("No results found.")
             sys.exit(1)
 
-        output = format_search_results(results, collection)
-        console.print(output)
+        if stream:
+            # Stream results one at a time
+            from .core import clean_content
+
+            for i, result in enumerate(results):
+                payload = result.payload
+                point_id = payload.get("message_id") or payload.get("id") or str(result.id)
+
+                console.print(f"=== {point_id} (score: {result.score:.2f}) ===")
+                if collection == "conversations":
+                    console.print(f"Role: {payload.get('role', 'unknown')}")
+                    console.print(f"Time: {payload.get('timestamp', 'N/A')}")
+                    console.print(f"Project: {payload.get('project_path', 'N/A')}")
+
+                    content = clean_content(payload.get("content", ""))
+                    content = str(content) if not isinstance(content, str) else content
+
+                    if show_tokens:
+                        from .core import count_tokens
+
+                        token_count = count_tokens(content)
+                        console.print(f"Tokens: {token_count:,}")
+
+                    console.print("")
+
+                    # Truncate long content
+                    max_len = 1500
+                    if len(content) > max_len:
+                        console.print(content[:max_len] + "...")
+                    else:
+                        console.print(content)
+
+                console.print("---")
+
+                # Small delay between results for streaming effect
+                if i < len(results) - 1:
+                    import time
+
+                    time.sleep(0.1)
+
+            if show_tokens:
+                from .core import count_tokens
+
+                total = sum(
+                    count_tokens(str(clean_content(r.payload.get("content", "")))) for r in results
+                )
+                console.print(f"\n=== Total: {len(results)} results, {total:,} tokens ===")
+        else:
+            # Non-streaming: output all at once
+            output = format_search_results(results, collection, show_tokens=show_tokens)
+            console.print(output)
 
     except Exception as e:
         console.print(f"[red]Error: {e}[/]")
