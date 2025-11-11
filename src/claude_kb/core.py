@@ -21,7 +21,7 @@ COLLECTION_ENTITIES = "entities"
 COLLECTION_DOCUMENTS = "documents"
 
 # Content truncation
-MAX_CONTENT_PREVIEW_LENGTH = 500  # Characters to show in search results
+MAX_CONTENT_PREVIEW_LENGTH = 1500  # Characters to show in search results (increased from 500)
 
 # Size estimation
 ESTIMATED_KB_PER_POINT = 1  # Rough estimate for 768-dim vector + metadata
@@ -160,6 +160,84 @@ class QdrantDB:
         results = self.client.retrieve(collection_name=collection, ids=[point_id])
         return results[0] if results else None
 
+    def get_thread_context(
+        self, collection: str, message_id: str, depth: int = 2
+    ) -> list[PointStruct]:
+        """
+        Get message with surrounding context from conversation thread.
+
+        Strategy:
+        1. Get target message to find conversation_id and timestamp
+        2. Scroll through conversation to find all messages
+        3. Sort by timestamp
+        4. Return target message ± depth messages
+
+        Args:
+            collection: Collection name (usually 'conversations')
+            message_id: Target message ID
+            depth: Number of messages before/after to include
+
+        Returns:
+            List of Point objects in chronological order
+        """
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        # Get target message
+        target = self.get_by_id(collection, message_id)
+        if not target:
+            return []
+
+        conversation_id = target.payload.get("conversation_id")
+        if not conversation_id:
+            return [target]
+
+        # Get all messages from this conversation
+        messages = []
+        offset = None
+
+        while True:
+            results = self.client.scroll(
+                collection_name=collection,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="conversation_id", match=MatchValue(value=conversation_id)
+                        )
+                    ]
+                ),
+                limit=100,
+                offset=offset,
+                with_payload=True,
+            )
+
+            points, offset = results
+            if not points:
+                break
+
+            messages.extend(points)
+
+            if offset is None:
+                break
+
+        # Sort by timestamp
+        messages.sort(key=lambda p: p.payload.get("timestamp", ""))
+
+        # Find target message index
+        target_idx = None
+        for i, msg in enumerate(messages):
+            if msg.id == message_id or msg.payload.get("message_id") == message_id:
+                target_idx = i
+                break
+
+        if target_idx is None:
+            return [target]
+
+        # Get context window
+        start = max(0, target_idx - depth)
+        end = min(len(messages), target_idx + depth + 1)
+
+        return messages[start:end]
+
     def get_stats(self) -> dict[str, int]:
         """
         Get collection statistics.
@@ -292,6 +370,43 @@ class AsyncQdrantDB:
 # =============================================================================
 
 
+def clean_content(content: str | list | dict) -> str | list | dict:
+    """
+    Remove signature fields from content to reduce noise and token usage.
+
+    Signatures are cryptographic verification data that:
+    - Consume hundreds of base64 characters
+    - Provide zero semantic value for search/retrieval
+    - Make results harder to read
+
+    Args:
+        content: Content string, list, or dict
+
+    Returns:
+        Cleaned content with signatures removed
+    """
+    import json
+
+    if isinstance(content, str):
+        # Try to parse as JSON if it looks like JSON
+        if content.strip().startswith("[") or content.strip().startswith("{"):
+            try:
+                parsed = json.loads(content)
+                cleaned = clean_content(parsed)
+                return (
+                    json.dumps(cleaned, indent=2) if isinstance(cleaned, (dict, list)) else content
+                )
+            except (json.JSONDecodeError, ValueError):
+                return content
+        return content
+    elif isinstance(content, list):
+        return [clean_content(item) for item in content]
+    elif isinstance(content, dict):
+        # Remove 'signature' key recursively
+        return {k: clean_content(v) for k, v in content.items() if k != "signature"}
+    return content
+
+
 def format_search_results(results, collection: str) -> str:
     """
     Format search results as structured text for LLM parsing.
@@ -334,7 +449,9 @@ def format_search_results(results, collection: str) -> str:
             lines.append(f"Time: {payload.get('timestamp', 'N/A')}")
             lines.append(f"Project: {payload.get('project_path', 'N/A')}")
             lines.append("")
-            content = payload.get("content", "")
+            # Clean signatures from content
+            content = clean_content(payload.get("content", ""))
+            content = str(content) if not isinstance(content, str) else content
             # Truncate long content
             if len(content) > MAX_CONTENT_PREVIEW_LENGTH:
                 lines.append(content[:MAX_CONTENT_PREVIEW_LENGTH] + "...")
@@ -377,6 +494,66 @@ def format_search_results(results, collection: str) -> str:
     return "\n".join(output)
 
 
+def format_thread_context(messages: list, target_id: str, collection: str, depth: int) -> str:
+    """
+    Format thread context showing messages before/after target.
+
+    Args:
+        messages: List of Point objects in chronological order
+        target_id: ID of the target message (highlighted)
+        collection: Collection name
+        depth: Depth setting for context
+
+    Returns:
+        Formatted string with thread context
+    """
+    if not messages:
+        return "No messages found in thread."
+
+    output = []
+    output.append(f"=== Thread Context (±{depth} messages) ===")
+    output.append("")
+
+    for i, point in enumerate(messages):
+        payload = point.payload
+        point_id = payload.get("message_id") or str(point.id)
+        is_target = point_id == target_id or str(point.id) == target_id
+
+        # Marker for target message
+        marker = ">>> TARGET <<<" if is_target else f"[{i + 1}/{len(messages)}]"
+
+        output.append(f"--- {marker} ---")
+        output.append(f"ID: {point_id}")
+        output.append(f"Role: {payload.get('role', 'unknown')}")
+        output.append(f"Time: {payload.get('timestamp', 'N/A')}")
+
+        if is_target:
+            output.append(f"Project: {payload.get('project_path', 'N/A')}")
+
+        output.append("")
+
+        # Clean and display content
+        content = clean_content(payload.get("content", ""))
+        content = str(content) if not isinstance(content, str) else content
+
+        # For target message, show more content
+        max_length = 2000 if is_target else 800
+        if len(content) > max_length:
+            output.append(content[:max_length] + f"... [{len(content) - max_length} chars more]")
+        else:
+            output.append(content)
+
+        output.append("")
+
+    # Summary footer
+    conv_id = messages[0].payload.get("conversation_id", "unknown")
+    output.append("---")
+    output.append(f"Conversation: {conv_id}")
+    output.append(f"Total messages in thread: {len(messages)}")
+
+    return "\n".join(output)
+
+
 def format_get_result(point, collection: str) -> str:
     """
     Format single item for get command.
@@ -403,7 +580,10 @@ def format_get_result(point, collection: str) -> str:
         lines.append(f"Conversation: {payload.get('conversation_id', 'N/A')}")
         lines.append(f"Project: {payload.get('project_path', 'N/A')}")
         lines.append("")
-        lines.append(payload.get("content", ""))
+        # Clean signatures from content
+        content = clean_content(payload.get("content", ""))
+        content = str(content) if not isinstance(content, str) else content
+        lines.append(content)
         lines.append("")
 
         # Related messages
