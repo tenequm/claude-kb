@@ -178,6 +178,9 @@ def search(query, collection, limit, stream, filter):
                 "Streaming mode not yet implemented. Remove --stream flag to use blocking mode."
             )
 
+        # Suppress INFO logs from core module (model loading messages)
+        logging.getLogger("claude_kb.core").setLevel(logging.WARNING)
+
         # Initialize
         db = QdrantDB(CONFIG["qdrant_url"], CONFIG["qdrant_api_key"], CONFIG["embedding_model"])
 
@@ -187,7 +190,14 @@ def search(query, collection, limit, stream, filter):
 
         # Detect vector configuration (named vs default)
         collection_info = db.client.get_collection(collection)
-        vector_names = list(collection_info.config.params.vectors.keys())
+        vectors = collection_info.config.params.vectors
+
+        # Check if vectors is a dict (named vectors) or VectorParams (single default vector)
+        if isinstance(vectors, dict):
+            vector_names = list(vectors.keys())
+        else:
+            # Single unnamed vector - use default behavior (don't specify vector_name)
+            vector_names = []
 
         # Search using pre-computed query embedding
         search_params = {
