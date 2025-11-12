@@ -71,7 +71,7 @@ def get_project_path_from_encoded(encoded_name: str) -> str:
     Convert encoded project directory name back to original path.
 
     Claude Code encodes paths like:
-    /Users/tenequm/Projects/claude-kb → -Users-tenequm-Projects-claude-kb
+    /Users/username/Projects/my-project → -Users-username-Projects-my-project
 
     Args:
         encoded_name: Encoded directory name
@@ -91,7 +91,7 @@ def find_project_dir(project_path: str, claude_dir: str = "~/.claude/projects") 
     Find encoded project directory for given path.
 
     Args:
-        project_path: Original project path (e.g., /Users/tenequm/Projects/claude-kb)
+        project_path: Original project path (e.g., /Users/username/Projects/my-project)
         claude_dir: Claude Code projects directory
 
     Returns:
@@ -102,7 +102,7 @@ def find_project_dir(project_path: str, claude_dir: str = "~/.claude/projects") 
         return None
 
     # Encode the path
-    # /Users/tenequm/Projects/exporter-x402 → -Users-tenequm-Projects-exporter-x402
+    # /Users/username/Projects/my-project → -Users-username-Projects-my-project
     encoded = project_path.replace("/", "-")
 
     project_dir = base / encoded

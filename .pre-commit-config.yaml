@@ -1,0 +1,50 @@
+# Pre-commit hooks for security and code quality
+# See https://pre-commit.com for more information
+
+repos:
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      # Security: Prevent committing sensitive files
+      - id: check-added-large-files
+        args: ['--maxkb=1000']  # Prevent files > 1MB
+        exclude: ^uv\.lock$  # Allow uv.lock to be large
+      - id: detect-private-key  # Detect private keys (.pem, .key, etc.)
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+
+  # Security: Detect secrets in code
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ['--baseline', '.secrets.baseline']
+        exclude: package.lock.json
+
+  # Python code formatting and linting
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+# Exclude patterns (don't run hooks on these files/directories)
+exclude: |
+  (?x)^(
+    \.venv/.*|
+    \.git/.*|
+    \.ruff_cache/.*|
+    __pycache__/.*|
+    build/.*|
+    dist/.*|
+    .*\.egg-info/.*|
+    qdrant_storage/.*|
+    uv\.lock
+  )$

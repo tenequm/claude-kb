@@ -443,7 +443,7 @@ def clean_content(content: str | list | dict) -> str | list | dict:
                 parsed = json.loads(content)
                 cleaned = clean_content(parsed)
                 return (
-                    json.dumps(cleaned, indent=2) if isinstance(cleaned, (dict, list)) else content
+                    json.dumps(cleaned, indent=2) if isinstance(cleaned, dict | list) else content
                 )
             except (json.JSONDecodeError, ValueError):
                 return content

@@ -51,6 +51,9 @@ htmlcov/
 .env.local
 *.log
 
+# Security scanning
+.secrets.baseline
+
 # Project-specific
 /data/
 /exports/

@@ -17,6 +17,8 @@ dependencies = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "tiktoken>=0.5.0",
+    "pre-commit>=3.0.0",
+    "detect-secrets>=1.5.0",
 ]
 
 [project.scripts]
