@@ -7,6 +7,26 @@ Provides semantic search across:
 - Personal knowledge entities
 - Documents and research notes
 
+## Installation
+
+### Run directly (no install)
+```bash
+uvx claude-kb status
+```
+
+### Install as a tool
+```bash
+uv tool install claude-kb
+kb status
+```
+
+### Development
+```bash
+git clone https://github.com/tenequm/claude-kb.git
+cd claude-kb
+uv sync --extra dev
+```
+
 ## Features
 
 - **Hybrid search**: Dense (semantic) + sparse (keyword) vectors with RRF fusion
@@ -18,20 +38,17 @@ Provides semantic search across:
 ## Quick Start
 
 ```bash
-# Install dependencies
-uv sync --extra dev
-
 # Start Qdrant
 docker compose up -d
 
 # Initialize collections
-uv run kb init
+kb init
 
 # Import your Claude Code conversations
-uv run kb import claude-code-chats
+kb import claude-code-chats
 
 # Search!
-uv run kb search "qdrant vector databases"
+kb search "qdrant vector databases"
 ```
 
 ## Usage
