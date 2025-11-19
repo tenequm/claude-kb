@@ -11,13 +11,16 @@ Provides semantic search across:
 
 ### Run directly (no install)
 ```bash
-uvx claude-kb status
+uvx claude-kb@latest status
 ```
 
 ### Install as a tool
 ```bash
 uv tool install claude-kb
 kb status
+
+# Update to latest version
+uv tool upgrade claude-kb
 ```
 
 ### Development
