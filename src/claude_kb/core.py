@@ -2,13 +2,22 @@
 
 import hashlib
 import logging
+from typing import TypedDict
 
 import numpy as np
 from qdrant_client import AsyncQdrantClient, QdrantClient
-from qdrant_client.models import Filter, PointStruct
+from qdrant_client.http.models import Record
+from qdrant_client.models import Filter
 from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
+
+
+# Type definitions
+class ProjectStats(TypedDict):
+    project: str
+    sessions: int
+    messages: int
 
 
 # =============================================================================
@@ -17,8 +26,6 @@ logger = logging.getLogger(__name__)
 
 # Collection names
 COLLECTION_CONVERSATIONS = "conversations"
-COLLECTION_ENTITIES = "entities"
-COLLECTION_DOCUMENTS = "documents"
 
 # Content truncation
 MAX_CONTENT_PREVIEW_LENGTH = 1500  # Characters to show in search results (increased from 500)
@@ -92,6 +99,7 @@ class EmbeddingModel:
         if self._model is None:
             self.load()
 
+        assert self._model is not None  # Guaranteed by load()
         return self._model.encode(
             texts,
             batch_size=batch_size,
@@ -99,6 +107,47 @@ class EmbeddingModel:
             convert_to_numpy=True,
             normalize_embeddings=True,
         )
+
+
+class SparseEmbeddingModel:
+    """SPLADE sparse embedding model via FastEmbed for hybrid search."""
+
+    def __init__(self, model_name: str = "prithivida/Splade_PP_en_v1"):
+        """
+        Initialize sparse embedding model.
+
+        Args:
+            model_name: FastEmbed sparse model name
+        """
+        self.model_name = model_name
+        self._model = None
+
+    def load(self) -> None:
+        """Load the model (lazy loading on first use)."""
+        if self._model is not None:
+            return
+
+        logger.info(f"Loading sparse embedding model: {self.model_name}")
+        from fastembed import SparseTextEmbedding
+
+        self._model = SparseTextEmbedding(self.model_name)
+        logger.info("✓ Sparse model loaded")
+
+    def encode(self, texts: list[str]) -> list:
+        """
+        Generate sparse embeddings for texts.
+
+        Args:
+            texts: List of text strings
+
+        Returns:
+            List of SparseEmbedding objects with indices and values
+        """
+        if self._model is None:
+            self.load()
+
+        assert self._model is not None  # Guaranteed by load()
+        return list(self._model.embed(texts))
 
 
 # =============================================================================
@@ -127,6 +176,7 @@ class QdrantDB:
         self.url = url
         self.embedding_model_name = embedding_model
         self.embedding_model = EmbeddingModel(embedding_model)
+        self.sparse_model = SparseEmbeddingModel()
         logger.debug(f"Using embedding model: {embedding_model}")
 
     def init_collections(self) -> None:
@@ -146,7 +196,29 @@ class QdrantDB:
             logger.error(f"Failed to connect to Qdrant: {e}")
             raise
 
-    def get_by_id(self, collection: str, point_id: str) -> PointStruct | None:
+    def has_sparse_vectors(self, collection: str) -> bool:
+        """
+        Check if collection has sparse vectors configured.
+
+        Args:
+            collection: Collection name
+
+        Returns:
+            True if collection has sparse vectors
+        """
+        try:
+            info = self.client.get_collection(collection)
+            vectors = info.config.params.vectors
+
+            # Check for named vectors with 'sparse' key
+            if isinstance(vectors, dict):
+                return "sparse" in vectors
+
+            return False
+        except Exception:
+            return False
+
+    def get_by_id(self, collection: str, point_id: str) -> Record | None:
         """
         Retrieve single point by ID.
 
@@ -155,7 +227,7 @@ class QdrantDB:
             point_id: Point ID
 
         Returns:
-            Point object or None
+            Record object or None
         """
         results = self.client.retrieve(collection_name=collection, ids=[point_id])
         return results[0] if results else None
@@ -166,15 +238,19 @@ class QdrantDB:
         collection: str,
         limit: int = 10,
         query_filter: Filter | None = None,
+        score_threshold: float | None = None,
+        sparse_vector: dict | None = None,
     ) -> list:
         """
-        Search collection with optional metadata filtering.
+        Search collection with optional hybrid search (dense + sparse) and RRF fusion.
 
         Args:
-            query_vector: Query embedding vector
+            query_vector: Dense query embedding vector
             collection: Collection name
             limit: Maximum number of results
             query_filter: Optional Qdrant Filter for metadata filtering
+            score_threshold: Minimum score threshold (0.0-1.0)
+            sparse_vector: Optional sparse vector dict with 'indices' and 'values'
 
         Returns:
             List of search results (ScoredPoint objects)
@@ -183,35 +259,63 @@ class QdrantDB:
 
         # Detect vector configuration (named vs default)
         collection_info = self.client.get_collection(collection)
-        vectors = collection_info.config.params.vectors
+        vectors_config = collection_info.config.params.vectors
+        sparse_config = collection_info.config.params.sparse_vectors
+
+        # Check if collection has sparse vectors configured
+        has_sparse = sparse_config is not None and "sparse" in (sparse_config or {})
 
         # Check if vectors is a dict (named vectors) or VectorParams (single default vector)
-        if isinstance(vectors, dict):
-            vector_names = list(vectors.keys())
+        if isinstance(vectors_config, dict):
+            has_named_dense = "dense" in vectors_config
         else:
-            # Single unnamed vector - use default behavior
-            vector_names = []
+            has_named_dense = False
 
-        # Build search parameters
-        search_params = {
-            "collection_name": collection,
-            "query_vector": query_vector,
-            "limit": limit,
-        }
+        # Use hybrid search if collection supports it and sparse vector provided
+        if has_sparse and sparse_vector and has_named_dense:
+            # Hybrid search with prefetch + RRF fusion
+            logger.debug("Using hybrid search (dense + sparse) with RRF fusion")
 
-        # Add filter if provided
-        if query_filter:
-            search_params["query_filter"] = query_filter
+            prefetch_limit = limit * 3  # Fetch more candidates for fusion
 
-        # If collection has named vectors, specify which one to use
-        if vector_names:
-            search_params["vector_name"] = vector_names[0]
+            result = self.client.query_points(
+                collection_name=collection,
+                prefetch=[
+                    models.Prefetch(
+                        query=query_vector,
+                        using="dense",
+                        limit=prefetch_limit,
+                    ),
+                    models.Prefetch(
+                        query=models.SparseVector(
+                            indices=sparse_vector["indices"],
+                            values=sparse_vector["values"],
+                        ),
+                        using="sparse",
+                        limit=prefetch_limit,
+                    ),
+                ],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                query_filter=query_filter,
+                limit=limit,
+                score_threshold=score_threshold,
+            )
+        else:
+            # Dense-only search (original or migrated collection without sparse)
+            logger.debug("Using dense-only search")
 
-        return self.client.search(**search_params)
+            result = self.client.query_points(
+                collection_name=collection,
+                query=query_vector,
+                limit=limit,
+                query_filter=query_filter,
+                score_threshold=score_threshold,
+                using="dense" if has_named_dense else None,
+            )
 
-    def get_thread_context(
-        self, collection: str, message_id: str, depth: int = 2
-    ) -> list[PointStruct]:
+        return result.points
+
+    def get_thread_context(self, collection: str, message_id: str, depth: int = 2) -> list[Record]:
         """
         Get message with surrounding context from conversation thread.
 
@@ -227,7 +331,7 @@ class QdrantDB:
             depth: Number of messages before/after to include
 
         Returns:
-            List of Point objects in chronological order
+            List of Record objects in chronological order
         """
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
@@ -235,6 +339,9 @@ class QdrantDB:
         target = self.get_by_id(collection, message_id)
         if not target:
             return []
+
+        if not target.payload:
+            return [target]
 
         conversation_id = target.payload.get("conversation_id")
         if not conversation_id:
@@ -269,12 +376,12 @@ class QdrantDB:
                 break
 
         # Sort by timestamp
-        messages.sort(key=lambda p: p.payload.get("timestamp", ""))
+        messages.sort(key=lambda p: (p.payload or {}).get("timestamp", ""))
 
         # Find target message index
         target_idx = None
         for i, msg in enumerate(messages):
-            if msg.id == message_id or msg.payload.get("message_id") == message_id:
+            if msg.id == message_id or (msg.payload or {}).get("message_id") == message_id:
                 target_idx = i
                 break
 
@@ -305,9 +412,7 @@ class QdrantDB:
             logger.error(f"Failed to get stats: {e}")
             return {}
 
-    def get_project_stats(
-        self, collection: str = COLLECTION_CONVERSATIONS
-    ) -> list[dict[str, int | str]]:
+    def get_project_stats(self, collection: str = COLLECTION_CONVERSATIONS) -> list[ProjectStats]:
         """
         Get per-project statistics (sessions and messages).
 
@@ -334,6 +439,8 @@ class QdrantDB:
 
                 for point in points:
                     payload = point.payload
+                    if not payload:
+                        continue
                     project = payload.get("project_path", "Unknown")
                     conv_id = payload.get("conversation_id")
 
@@ -368,6 +475,33 @@ class QdrantDB:
             logger.error(f"Failed to get project stats: {e}")
             return []
 
+    def ensure_indices(self, collection: str = COLLECTION_CONVERSATIONS) -> None:
+        """
+        Create payload indices for efficient filtering.
+
+        Indices are created lazily on first search. Safe to call multiple times.
+        """
+        from qdrant_client.models import PayloadSchemaType
+
+        indices = [
+            ("project_path", PayloadSchemaType.KEYWORD),
+            ("timestamp", PayloadSchemaType.DATETIME),
+            ("role", PayloadSchemaType.KEYWORD),
+            ("conversation_id", PayloadSchemaType.KEYWORD),
+        ]
+
+        for field_name, field_schema in indices:
+            try:
+                self.client.create_payload_index(
+                    collection_name=collection,
+                    field_name=field_name,
+                    field_schema=field_schema,
+                )
+                logger.debug(f"Created index on {field_name}")
+            except Exception:
+                # Index already exists or other error - safe to ignore
+                pass
+
 
 class AsyncQdrantDB:
     """Async Qdrant vector database wrapper with sentence-transformers."""
@@ -390,6 +524,7 @@ class AsyncQdrantDB:
         self.url = url
         self.embedding_model_name = embedding_model
         self.embedding_model = EmbeddingModel(embedding_model)
+        self.sparse_model = SparseEmbeddingModel()
         logger.debug(f"Using async embedding model: {embedding_model}")
 
     async def init_collections(self) -> None:
@@ -490,6 +625,8 @@ def format_search_results(results, collection: str, show_tokens: bool = False) -
             point_id = result.id
         else:
             payload = result.payload
+            if payload is None:
+                continue  # Skip results without payload
             score = result.score
             point_id = payload.get("message_id") or payload.get("id") or str(result.id)
 
@@ -517,32 +654,6 @@ def format_search_results(results, collection: str, show_tokens: bool = False) -
                 lines.append(content[:MAX_CONTENT_PREVIEW_LENGTH] + "...")
             else:
                 lines.append(content)
-
-        elif collection == COLLECTION_ENTITIES:
-            lines.append(f"Type: {payload.get('type', 'unknown')}")
-            lines.append(f"Name: {payload.get('name', 'N/A')}")
-            description = payload.get("description", "")
-            if description:
-                lines.append("")
-                lines.append(
-                    description[:MAX_CONTENT_PREVIEW_LENGTH] + "..."
-                    if len(description) > MAX_CONTENT_PREVIEW_LENGTH
-                    else description
-                )
-
-        elif collection == COLLECTION_DOCUMENTS:
-            lines.append(f"Title: {payload.get('title', 'N/A')}")
-            lines.append(f"Source: {payload.get('source', 'N/A')}")
-            tags = payload.get("tags", [])
-            if tags:
-                lines.append(f"Tags: {', '.join(tags)}")
-            lines.append("")
-            content = payload.get("content", "")
-            lines.append(
-                content[:MAX_CONTENT_PREVIEW_LENGTH] + "..."
-                if len(content) > MAX_CONTENT_PREVIEW_LENGTH
-                else content
-            )
 
         else:
             # Generic format
@@ -579,7 +690,7 @@ def format_thread_context(messages: list, target_id: str, collection: str, depth
     output.append("")
 
     for i, point in enumerate(messages):
-        payload = point.payload
+        payload = point.payload or {}
         point_id = payload.get("message_id") or str(point.id)
         is_target = point_id == target_id or str(point.id) == target_id
 
@@ -610,7 +721,8 @@ def format_thread_context(messages: list, target_id: str, collection: str, depth
         output.append("")
 
     # Summary footer
-    conv_id = messages[0].payload.get("conversation_id", "unknown")
+    first_payload = messages[0].payload or {}
+    conv_id = first_payload.get("conversation_id", "unknown")
     output.append("---")
     output.append(f"Conversation: {conv_id}")
     output.append(f"Total messages in thread: {len(messages)}")
@@ -633,6 +745,9 @@ def format_get_result(point, collection: str) -> str:
         return "Not found."
 
     payload = point.payload
+    if payload is None:
+        return f"=== {point.id} (no payload) ==="
+
     point_id = payload.get("message_id") or payload.get("id") or str(point.id)
 
     lines = [f"=== {point_id} ==="]
@@ -656,35 +771,9 @@ def format_get_result(point, collection: str) -> str:
             lines.append("Related:")
             lines.append(f"  Parent: {parent_id}")
 
-    elif collection == "entities":
-        lines.append(f"Type: {payload.get('type', 'unknown')}")
-        lines.append(f"Name: {payload.get('name', 'N/A')}")
-        lines.append(f"Created: {payload.get('created_at', 'N/A')}")
-        lines.append(f"Updated: {payload.get('updated_at', 'N/A')}")
-        lines.append("")
-        lines.append(payload.get("description", ""))
-
-        # Relationships
-        relationships = payload.get("relationships", {})
-        if relationships:
-            lines.append("")
-            lines.append("Relationships:")
-            for rel_type, targets in relationships.items():
-                lines.append(f"  {rel_type}: {', '.join(targets)}")
-
-    elif collection == "documents":
-        lines.append("Type: document")
-        lines.append(f"Title: {payload.get('title', 'N/A')}")
-        lines.append(f"Source: {payload.get('source', 'N/A')}")
-        lines.append(f"Document ID: {payload.get('document_id', 'N/A')}")
-        lines.append(
-            f"Chunk: {payload.get('chunk_index', 0)} of {payload.get('metadata', {}).get('total_chunks', '?')}"
-        )
-        tags = payload.get("tags", [])
-        if tags:
-            lines.append(f"Tags: {', '.join(tags)}")
-        lines.append("")
-        lines.append(payload.get("content", ""))
+    else:
+        # Generic format for unknown collections
+        lines.append(str(payload))
 
     return "\n".join(lines)
 

@@ -1,13 +1,11 @@
 """Import Claude Code conversation history."""
 
-import asyncio
 import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from qdrant_client import models
 from rich.console import Console
@@ -272,7 +270,7 @@ async def get_existing_message_ids_async(async_db, collection: str) -> set[str]:
 
 
 async def _upload_batch_async(
-    client, collection: str, batch_messages: list[dict], embedding_model
+    client, collection: str, batch_messages: list[dict], embedding_model, sparse_model=None
 ) -> int:
     """
     Upload a batch of messages to Qdrant asynchronously.
@@ -281,7 +279,8 @@ async def _upload_batch_async(
         client: AsyncQdrantClient instance
         collection: Collection name
         batch_messages: List of message dicts to upload
-        embedding_model: EmbeddingModel instance
+        embedding_model: EmbeddingModel instance (dense)
+        sparse_model: Optional SparseEmbeddingModel for hybrid search
 
     Returns:
         Number of messages uploaded
@@ -319,20 +318,65 @@ async def _upload_batch_async(
             }
         )
 
-    # Generate embeddings using sentence-transformers (MPS-accelerated)
+    # Generate dense embeddings using sentence-transformers (MPS-accelerated)
     embeddings = embedding_model.encode(batch_documents, batch_size=100, show_progress=False)
 
+    # Check if collection supports hybrid search (named vectors)
+    try:
+        info = await client.get_collection(collection)
+        vectors_config = info.config.params.vectors
+        sparse_config = info.config.params.sparse_vectors
+        has_sparse = sparse_config is not None and "sparse" in (sparse_config or {})
+        has_named_dense = isinstance(vectors_config, dict) and "dense" in vectors_config
+        use_hybrid = has_sparse and has_named_dense and sparse_model is not None
+    except Exception:
+        use_hybrid = False
+
     # Upload batch with pre-computed embeddings
-    points = [
-        models.PointStruct(
-            id=batch_ids[i], vector=embeddings[i].tolist(), payload=batch_payloads[i]
+    if use_hybrid and sparse_model is not None:
+        # Generate sparse embeddings for hybrid search
+        sparse_embeddings = sparse_model.encode(
+            [str(doc)[:8000] for doc in batch_documents]  # Truncate for SPLADE
         )
-        for i in range(len(batch_ids))
-    ]
+
+        points = [
+            models.PointStruct(
+                id=batch_ids[i],
+                vector={
+                    "dense": embeddings[i].tolist(),
+                    "sparse": models.SparseVector(
+                        indices=sparse_embeddings[i].indices.tolist(),
+                        values=sparse_embeddings[i].values.tolist(),
+                    ),
+                },
+                payload=batch_payloads[i],
+            )
+            for i in range(len(batch_ids))
+        ]
+    else:
+        # Dense-only (legacy collection)
+        points = [
+            models.PointStruct(
+                id=batch_ids[i], vector=embeddings[i].tolist(), payload=batch_payloads[i]
+            )
+            for i in range(len(batch_ids))
+        ]
 
     await client.upsert(collection_name=collection, points=points)
 
     return len(batch_messages)
+
+
+async def _get_best_collection(client) -> str:
+    """Auto-detect best collection (prefer hybrid if exists)."""
+    try:
+        collections = await client.get_collections()
+        collection_names = [c.name for c in collections.collections]
+        if "conversations_hybrid" in collection_names:
+            return "conversations_hybrid"
+        return "conversations"
+    except Exception:
+        return "conversations"
 
 
 async def import_conversations_async(
@@ -434,15 +478,20 @@ async def import_conversations_async(
         console.print("\n[yellow]No messages found[/yellow]\n")
         return stats
 
-    # 3. Get existing messages for incremental import
+    # 3. Auto-detect best collection (prefer hybrid)
+    collection = await _get_best_collection(async_db.client)
+    if collection == "conversations_hybrid":
+        console.print("[cyan]Using hybrid search collection (conversations_hybrid)[/cyan]")
+
+    # 4. Get existing messages for incremental import
     console.print()
     with console.status("[yellow]Checking existing messages in Qdrant...[/yellow]", spinner="dots"):
-        existing_ids = await get_existing_message_ids_async(async_db, "conversations")
+        existing_ids = await get_existing_message_ids_async(async_db, collection)
 
     if existing_ids:
         console.print(f"[dim]   Found {len(existing_ids):,} existing messages (will skip)[/dim]")
 
-    # 4. Filter to only new messages
+    # 5. Filter to only new messages
     new_messages = [msg for msg in all_messages if msg["message_id"] not in existing_ids]
     stats["skipped"] = len(all_messages) - len(new_messages)
 
@@ -464,14 +513,14 @@ async def import_conversations_async(
 
     # Ensure collection exists (auto-create if needed)
     try:
-        await async_db.client.get_collection("conversations")
+        await async_db.client.get_collection(collection)
     except Exception:
-        # Collection doesn't exist, create it
-        console.print("[yellow]Creating conversations collection...[/yellow]")
+        # Collection doesn't exist, create it (dense-only for backwards compatibility)
+        console.print(f"[yellow]Creating {collection} collection...[/yellow]")
         from qdrant_client.models import Distance, VectorParams
 
         await async_db.client.create_collection(
-            collection_name="conversations",
+            collection_name=collection,
             vectors_config=VectorParams(size=768, distance=Distance.COSINE),
         )
         console.print("[green]✓ Collection created[/green]")
@@ -511,9 +560,10 @@ async def import_conversations_async(
             for batch in batches:
                 count = await _upload_batch_async(
                     async_db.client,
-                    "conversations",
+                    collection,
                     batch,
                     async_db.embedding_model,
+                    async_db.sparse_model,
                 )
                 messages_uploaded += count
 
