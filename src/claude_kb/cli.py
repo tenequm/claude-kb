@@ -4,26 +4,22 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import UTC
+from importlib.metadata import version
 from pathlib import Path
-from typing import TypedDict
 
 import click
 import torch
+
+# Load environment variables
 from dotenv import load_dotenv
 from rich.console import Console
 
-from . import __version__
-from .core import (
-    AsyncQdrantDB,
-    QdrantDB,
-    format_get_result,
-    format_search_results,
-    format_thread_context,
-)
-from .import_claude import import_conversations_async
+from .config import get_config
+from .db import AsyncQdrantDB, QdrantDB
+from .formatters import format_get, format_search, format_status, format_thread
+from .models import ErrorResult
+from .search import SearchService
 
-# Load environment variables
 load_dotenv()
 
 # Enable MPS fallback for Apple Silicon (must be before any torch operations)
@@ -31,24 +27,7 @@ if torch.backends.mps.is_available():
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     logging.getLogger(__name__).debug("MPS detected: Enabled CPU fallback for unsupported ops")
 
-
-# Configuration type
-class Config(TypedDict):
-    qdrant_url: str
-    qdrant_api_key: str | None
-    embedding_model: str
-    hf_token: str | None
-    use_hf_api: bool
-
-
-CONFIG: Config = {
-    "qdrant_url": os.getenv("QDRANT_URL", "http://localhost:6333"),
-    "qdrant_api_key": os.getenv("QDRANT_API_KEY"),
-    "embedding_model": os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5"),
-    "hf_token": os.getenv("HF_TOKEN"),  # For HF Inference API (faster than local)
-    "use_hf_api": os.getenv("USE_HF_API", "false").lower() == "true",
-}
-
+__version__ = version("claude-kb")
 console = Console()
 
 # Setup logging
@@ -57,7 +36,7 @@ logging.basicConfig(
     format="%(levelname)s: %(message)s",
 )
 
-# Suppress HTTP request logs from httpx (used by qdrant_client)
+# Suppress HTTP request logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -116,8 +95,168 @@ kb migrate
 
 # status - Show database statistics
 kb status
+
+# mcp - Run as MCP server for Claude Code integration
+kb mcp
+Add to Claude Code: claude mcp add kb -- uv run kb mcp
+Exposes: search, get tools
 """
     console.print(schema)
+
+
+# =============================================================================
+# SEARCH COMMAND
+# =============================================================================
+
+
+@main.command()
+@click.argument("query")
+@click.option("--limit", "-l", default=10, help="Max results")
+@click.option("--project", "-p", help="Filter by project path (partial match)")
+@click.option("--from", "from_date", help="Filter by date from (ISO format: YYYY-MM-DD)")
+@click.option("--to", "to_date", help="Filter by date to (ISO format: YYYY-MM-DD)")
+@click.option("--conversation", help="Filter by conversation ID (exact match)")
+@click.option(
+    "--role",
+    type=click.Choice(["user", "assistant"], case_sensitive=False),
+    help="Filter by message role",
+)
+@click.option("--show-tokens", is_flag=True, help="Display token counts for each result")
+@click.option("--min-score", type=float, default=0.5, help="Minimum relevance score (0.0-1.0)")
+@click.option(
+    "--boost-recent/--no-boost-recent",
+    default=True,
+    help="Boost recent messages in ranking (default: on)",
+)
+def search(
+    query,
+    limit,
+    project,
+    from_date,
+    to_date,
+    conversation,
+    role,
+    show_tokens,
+    min_score,
+    boost_recent,
+):
+    """Semantic search with optional metadata filtering."""
+    try:
+        service = SearchService()
+        result = service.search(
+            query=query,
+            limit=limit,
+            project=project,
+            from_date=from_date,
+            to_date=to_date,
+            role=role,
+            conversation=conversation,
+            min_score=min_score,
+            boost_recent=boost_recent,
+        )
+
+        if isinstance(result, ErrorResult):
+            console.print(f"[red]Error: {result.error}[/]")
+            sys.exit(2)
+
+        console.print(format_search(result, show_tokens=show_tokens))
+
+        if result.count == 0:
+            sys.exit(1)
+
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/]")
+        logging.exception("Search failed")
+        sys.exit(2)
+
+
+# =============================================================================
+# GET COMMAND
+# =============================================================================
+
+
+@main.command()
+@click.argument("message_id")
+@click.option(
+    "--context-window",
+    type=int,
+    help="Truncate content to N characters (0 = unlimited, default: unlimited)",
+)
+def get(message_id, context_window):
+    """Retrieve message by ID."""
+    try:
+        service = SearchService()
+        result = service.get(message_id)
+
+        if isinstance(result, ErrorResult):
+            console.print(f"[red]{result.error}[/]")
+            sys.exit(1)
+
+        console.print(format_get(result, context_window=context_window))
+
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/]")
+        logging.exception("Get failed")
+        sys.exit(2)
+
+
+# =============================================================================
+# GET-THREAD COMMAND
+# =============================================================================
+
+
+@main.command("get-thread")
+@click.argument("message_id")
+@click.option("--depth", "-d", default=2, type=int, help="Messages before/after to include")
+def get_thread(message_id, depth):
+    """Get message with surrounding conversation context."""
+    try:
+        service = SearchService()
+
+        with console.status(
+            f"[yellow]Fetching thread context (±{depth} messages)...[/yellow]", spinner="dots"
+        ):
+            result = service.get(message_id, context_depth=depth)
+
+        if isinstance(result, ErrorResult):
+            console.print(f"[red]{result.error}[/]")
+            sys.exit(1)
+
+        console.print(format_thread(result))
+
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/]")
+        logging.exception("Get thread failed")
+        sys.exit(2)
+
+
+# =============================================================================
+# STATUS COMMAND
+# =============================================================================
+
+
+@main.command()
+def status():
+    """Show database statistics."""
+    try:
+        console.print("[bold cyan]=== Claude KB Status ===[/]")
+        console.print()
+
+        service = SearchService()
+
+        with console.status("[yellow]Analyzing projects...[/yellow]", spinner="dots"):
+            result = service.status(include_projects=True)
+
+        if isinstance(result, ErrorResult):
+            console.print(f"[red]Error: {result.error}[/]")
+            sys.exit(2)
+
+        console.print(format_status(result))
+
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/]")
+        logging.exception("Status failed")
+        sys.exit(2)
 
 
 # =============================================================================
@@ -138,15 +277,18 @@ kb status
 def import_claude_code_chats(project, session_file, include_meta, dry_run):
     """Import Claude Code conversation history (async-optimized)."""
     try:
+        from .import_claude import import_conversations_async
+
         console.print("[bold cyan]=== Importing Claude Code Conversations ===[/]")
         console.print()
 
         # Session path
         session_path = Path(session_file) if session_file else None
+        config = get_config()
 
         async def _run_async():
             async_db = AsyncQdrantDB(
-                CONFIG["qdrant_url"], CONFIG["qdrant_api_key"], CONFIG["embedding_model"]
+                config.qdrant_url, config.qdrant_api_key, config.embedding_model
             )
             try:
                 return await import_conversations_async(
@@ -178,343 +320,6 @@ def import_claude_code_chats(project, session_file, include_meta, dry_run):
 
 
 # =============================================================================
-# SEARCH COMMAND
-# =============================================================================
-
-
-def get_default_collection(db) -> str:
-    """Return best available collection (prefer hybrid if exists)."""
-    try:
-        collections = [c.name for c in db.client.get_collections().collections]
-        if "conversations_hybrid" in collections:
-            return "conversations_hybrid"
-        return "conversations"
-    except Exception:
-        return "conversations"
-
-
-@main.command()
-@click.argument("query")
-@click.option("--collection", "-c", default=None, help="Collection to search (auto-detects hybrid)")
-@click.option("--limit", "-l", default=10, help="Max results")
-@click.option("--stream", "-s", is_flag=True, help="Stream results (background mode)")
-@click.option("--project", "-p", help="Filter by project path (partial match)")
-@click.option("--from", "from_date", help="Filter by date from (ISO format: YYYY-MM-DD)")
-@click.option("--to", "to_date", help="Filter by date to (ISO format: YYYY-MM-DD)")
-@click.option("--conversation", help="Filter by conversation ID (exact match)")
-@click.option(
-    "--role",
-    type=click.Choice(["user", "assistant"], case_sensitive=False),
-    help="Filter by message role",
-)
-@click.option("--show-tokens", is_flag=True, help="Display token counts for each result")
-@click.option("--min-score", type=float, default=0.5, help="Minimum relevance score (0.0-1.0)")
-@click.option(
-    "--boost-recent/--no-boost-recent",
-    default=True,
-    help="Boost recent messages in ranking (default: on)",
-)
-def search(
-    query,
-    collection,
-    limit,
-    stream,
-    project,
-    from_date,
-    to_date,
-    conversation,
-    role,
-    show_tokens,
-    min_score,
-    boost_recent,
-):
-    """Semantic search with optional metadata filtering. Uses hybrid search when available."""
-    try:
-        # Suppress INFO logs from core module (model loading messages)
-        logging.getLogger("claude_kb.core").setLevel(logging.WARNING)
-
-        # Initialize
-        db = QdrantDB(CONFIG["qdrant_url"], CONFIG["qdrant_api_key"], CONFIG["embedding_model"])
-
-        # Auto-detect best collection if not specified
-        if collection is None:
-            collection = get_default_collection(db)
-
-        # Ensure payload indices exist for efficient filtering
-        db.ensure_indices(collection)
-
-        # Load dense embedding model and encode query
-        db.embedding_model.load()
-        query_vector = db.embedding_model.encode([query], batch_size=1, show_progress=False)[0]
-
-        # Check if collection supports hybrid search (has sparse vectors)
-        sparse_vector = None
-        if db.has_sparse_vectors(collection):
-            # Load sparse model and generate sparse embedding
-            db.sparse_model.load()
-            sparse_embeddings = db.sparse_model.encode([query])
-            sparse = sparse_embeddings[0]
-            sparse_vector = {
-                "indices": sparse.indices.tolist(),
-                "values": sparse.values.tolist(),
-            }
-
-        # Build Qdrant filter from CLI flags (server-side filtering)
-        query_filter = None
-        filter_conditions = []
-
-        if project or conversation or role:
-            from qdrant_client.models import FieldCondition, Filter, MatchText, MatchValue
-
-            # Project filter (partial match using MatchText)
-            if project:
-                filter_conditions.append(
-                    FieldCondition(key="project_path", match=MatchText(text=project))
-                )
-
-            # Conversation ID filter (exact match)
-            if conversation:
-                filter_conditions.append(
-                    FieldCondition(key="conversation_id", match=MatchValue(value=conversation))
-                )
-
-            # Role filter (exact match)
-            if role:
-                filter_conditions.append(
-                    FieldCondition(key="role", match=MatchValue(value=role.lower()))
-                )
-
-            # Combine all conditions with AND logic
-            if filter_conditions:
-                query_filter = Filter(must=filter_conditions)
-
-        # Search using hybrid or dense-only depending on collection config
-        search_limit = limit * 3 if (from_date or to_date) else limit
-        results = db.search(
-            query_vector=query_vector.tolist(),
-            collection=collection,
-            limit=search_limit,
-            query_filter=query_filter,
-            score_threshold=min_score,
-            sparse_vector=sparse_vector,
-        )
-
-        # Client-side date filtering (since timestamps are ISO strings, not numbers)
-        if from_date or to_date:
-            filtered_results = []
-            from_ts = f"{from_date}T00:00:00" if from_date else None
-            to_ts = f"{to_date}T23:59:59" if to_date else None
-
-            for result in results:
-                timestamp = result.payload.get("timestamp", "")
-                if from_ts and timestamp < from_ts:
-                    continue
-                if to_ts and timestamp > to_ts:
-                    continue
-                filtered_results.append(result)
-
-            results = filtered_results[:limit]
-
-        # Apply recency boosting if enabled
-        if boost_recent and results:
-            import math
-            from datetime import datetime
-
-            now = datetime.now(UTC)
-            one_week_seconds = 7 * 24 * 60 * 60  # Decay half-life
-
-            def apply_recency_boost(result):
-                """Apply exponential decay boost based on message age."""
-                timestamp_str = result.payload.get("timestamp", "")
-                try:
-                    # Parse ISO timestamp
-                    if "+" in timestamp_str or timestamp_str.endswith("Z"):
-                        ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-                    else:
-                        ts = datetime.fromisoformat(timestamp_str).replace(tzinfo=UTC)
-
-                    # Calculate age in seconds
-                    age_seconds = (now - ts).total_seconds()
-                    age_seconds = max(0, age_seconds)  # No negative ages
-
-                    # Exponential decay: boost = 0.2 * exp(-age / scale)
-                    # This adds up to 0.2 boost for very recent messages, decaying over time
-                    recency_boost = 0.2 * math.exp(-age_seconds / one_week_seconds)
-
-                    # Create modified score (without mutating original)
-                    return (result.score + recency_boost, result)
-                except (ValueError, TypeError):
-                    return (result.score, result)
-
-            # Sort by boosted score
-            boosted = [apply_recency_boost(r) for r in results]
-            boosted.sort(key=lambda x: x[0], reverse=True)
-
-            # Update result scores for display (create wrapper with new score)
-            class BoostedResult:
-                """Wrapper to show boosted score while preserving original data."""
-
-                def __init__(self, original, boosted_score):
-                    self.payload = original.payload
-                    self.id = original.id
-                    self.score = boosted_score
-
-            results = [BoostedResult(r, score) for score, r in boosted]
-
-        # Format and output
-        if not results:
-            console.print("No results found.")
-            sys.exit(1)
-
-        if stream:
-            # Stream results one at a time
-            from .core import clean_content
-
-            for i, result in enumerate(results):
-                payload = result.payload
-                point_id = payload.get("message_id") or payload.get("id") or str(result.id)
-
-                console.print(f"=== {point_id} (score: {result.score:.2f}) ===")
-                if collection.startswith("conversations"):
-                    console.print(f"Role: {payload.get('role', 'unknown')}")
-                    console.print(f"Time: {payload.get('timestamp', 'N/A')}")
-                    console.print(f"Project: {payload.get('project_path', 'N/A')}")
-
-                    content = clean_content(payload.get("content", ""))
-                    content = str(content) if not isinstance(content, str) else content
-
-                    if show_tokens:
-                        from .core import count_tokens
-
-                        token_count = count_tokens(content)
-                        console.print(f"Tokens: {token_count:,}")
-
-                    console.print("")
-
-                    # Truncate long content
-                    max_len = 1500
-                    if len(content) > max_len:
-                        console.print(content[:max_len] + "...")
-                    else:
-                        console.print(content)
-
-                console.print("---")
-
-                # Small delay between results for streaming effect
-                if i < len(results) - 1:
-                    import time
-
-                    time.sleep(0.1)
-
-            if show_tokens:
-                from .core import count_tokens
-
-                total = sum(
-                    count_tokens(str(clean_content(r.payload.get("content", "")))) for r in results
-                )
-                console.print(f"\n=== Total: {len(results)} results, {total:,} tokens ===")
-        else:
-            # Non-streaming: output all at once
-            output = format_search_results(results, collection, show_tokens=show_tokens)
-            console.print(output)
-
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/]")
-        logging.exception("Search failed")
-        sys.exit(2)
-
-
-# =============================================================================
-# GET COMMAND
-# =============================================================================
-
-
-@main.command()
-@click.argument("item_id")
-@click.option(
-    "--context-window",
-    type=int,
-    help="Truncate content to N characters (0 = unlimited, default: unlimited)",
-)
-@click.option("--collection", "-c", default=None, help="Collection (auto-detects hybrid)")
-def get(item_id, context_window, collection):
-    """Retrieve item by ID."""
-    try:
-        # Initialize
-        db = QdrantDB(CONFIG["qdrant_url"], CONFIG["qdrant_api_key"], CONFIG["embedding_model"])
-
-        # Auto-detect best collection if not specified
-        if collection is None:
-            collection = get_default_collection(db)
-
-        # Retrieve
-        point = db.get_by_id(collection, item_id)
-
-        if point is None:
-            console.print(f"Not found: {item_id}")
-            sys.exit(1)
-            return  # Explicit return for type narrowing
-
-        # Apply context window truncation if specified
-        if context_window and context_window > 0 and point.payload:
-            content = point.payload.get("content", "")
-            if isinstance(content, str) and len(content) > context_window:
-                point.payload["content"] = (
-                    content[:context_window]
-                    + f"\n\n[... +{len(content) - context_window} chars truncated. "
-                    f"Use --context-window 0 for full content]"
-                )
-
-        # Format and output
-        output = format_get_result(point, collection)
-        console.print(output)
-
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/]")
-        logging.exception("Get failed")
-        sys.exit(2)
-
-
-# =============================================================================
-# GET-THREAD COMMAND
-# =============================================================================
-
-
-@main.command()
-@click.argument("message_id")
-@click.option("--depth", "-d", default=2, type=int, help="Messages before/after to include")
-@click.option("--collection", "-c", default=None, help="Collection (auto-detects hybrid)")
-def get_thread(message_id, depth, collection):
-    """Get message with surrounding conversation context."""
-    try:
-        # Initialize
-        db = QdrantDB(CONFIG["qdrant_url"], CONFIG["qdrant_api_key"], CONFIG["embedding_model"])
-
-        # Auto-detect best collection if not specified
-        if collection is None:
-            collection = get_default_collection(db)
-
-        # Get thread context
-        with console.status(
-            f"[yellow]Fetching thread context (±{depth} messages)...[/yellow]", spinner="dots"
-        ):
-            messages = db.get_thread_context(collection, message_id, depth)
-
-        if not messages:
-            console.print(f"Not found: {message_id}")
-            sys.exit(1)
-
-        # Format and output
-        output = format_thread_context(messages, message_id, collection, depth)
-        console.print(output)
-
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/]")
-        logging.exception("Get thread failed")
-        sys.exit(2)
-
-
-# =============================================================================
 # MIGRATE COMMAND
 # =============================================================================
 
@@ -536,8 +341,8 @@ def migrate(collection, batch_size, dry_run):
         console.print("[bold cyan]=== Hybrid Search Migration ===[/]")
         console.print()
 
-        # Initialize
-        db = QdrantDB(CONFIG["qdrant_url"], CONFIG["qdrant_api_key"], CONFIG["embedding_model"])
+        config = get_config()
+        db = QdrantDB(config.qdrant_url, config.qdrant_api_key, config.embedding_model)
 
         # Check if collection exists
         try:
@@ -553,7 +358,6 @@ def migrate(collection, batch_size, dry_run):
         if vectors is None:
             console.print("[red]Collection has no vector configuration[/]")
             sys.exit(1)
-            return  # Explicit return for type narrowing
 
         if isinstance(vectors, dict) and "sparse" in vectors:
             console.print("[green]✓ Collection already has sparse vectors - no migration needed[/]")
@@ -561,11 +365,9 @@ def migrate(collection, batch_size, dry_run):
 
         # Get vector dimension from existing collection
         if isinstance(vectors, dict):
-            # Named vectors - get first one's dimension
             first_vec = list(vectors.values())[0]
             vector_dim = first_vec.size
         else:
-            # Single unnamed vector
             vector_dim = vectors.size
 
         console.print(f"Vector dimension: {vector_dim}")
@@ -597,7 +399,7 @@ def migrate(collection, batch_size, dry_run):
             },
             sparse_vectors_config={
                 "sparse": models.SparseVectorParams(
-                    modifier=models.Modifier.IDF,  # Improve sparse vector quality
+                    modifier=models.Modifier.IDF,
                 ),
             },
         )
@@ -625,7 +427,6 @@ def migrate(collection, batch_size, dry_run):
             task = progress.add_task("Migrating...", total=total_points)
 
             while True:
-                # Scroll through source collection
                 results = db.client.scroll(
                     collection_name=collection,
                     limit=batch_size,
@@ -650,7 +451,7 @@ def migrate(collection, batch_size, dry_run):
                         import json
 
                         content = json.dumps(content)
-                    contents.append(str(content)[:8000])  # Truncate for SPLADE
+                    contents.append(str(content)[:8000])
 
                 # Generate sparse embeddings
                 sparse_embeddings = db.sparse_model.encode(contents)
@@ -658,13 +459,11 @@ def migrate(collection, batch_size, dry_run):
                 # Build new points with both vectors
                 new_points = []
                 for i, point in enumerate(points):
-                    # Get existing dense vector
                     if isinstance(point.vector, dict):
                         dense_vec = list(point.vector.values())[0]
                     else:
                         dense_vec = point.vector
 
-                    # Get sparse vector (indices and values)
                     sparse = sparse_embeddings[i]
 
                     new_points.append(
@@ -681,7 +480,6 @@ def migrate(collection, batch_size, dry_run):
                         )
                     )
 
-                # Upsert to new collection
                 db.client.upsert(collection_name=new_collection, points=new_points)
 
                 migrated += len(points)
@@ -693,30 +491,6 @@ def migrate(collection, batch_size, dry_run):
         console.print()
         console.print(f"[green]✓ Migrated {migrated:,} points to {new_collection}[/]")
 
-        # Swap collections
-        console.print()
-        console.print("Swapping collections...")
-
-        backup_name = f"{collection}_backup"
-        try:
-            db.client.delete_collection(backup_name)
-        except Exception:
-            pass
-
-        # Rename: original → backup
-        db.client.update_collection_aliases(
-            change_aliases_operations=[
-                models.CreateAliasOperation(
-                    create_alias=models.CreateAlias(
-                        collection_name=collection,
-                        alias_name=backup_name,
-                    )
-                )
-            ]
-        )
-
-        # Actually we need to use a different approach - Qdrant aliases don't rename
-        # Let's just inform the user
         console.print()
         console.print("[bold green]Migration complete![/]")
         console.print()
@@ -728,10 +502,6 @@ def migrate(collection, batch_size, dry_run):
             f"  2. To use hybrid search, update your collection references to '{new_collection}'"
         )
         console.print(f"  3. Original collection '{collection}' preserved as backup")
-        console.print()
-        console.print(
-            "[dim]Tip: To make hybrid the default, you can rename collections in Qdrant dashboard[/]"
-        )
 
     except Exception as e:
         console.print(f"[red]Error: {e}[/]")
@@ -740,80 +510,21 @@ def migrate(collection, batch_size, dry_run):
 
 
 # =============================================================================
-# STATUS COMMAND
+# MCP COMMAND
 # =============================================================================
 
 
 @main.command()
-def status():
-    """Show database statistics."""
-    try:
-        from rich.table import Table
+def mcp():
+    """Run as MCP server for Claude Code integration.
 
-        console.print("[bold cyan]=== Claude KB Status ===[/]")
-        console.print()
+    Usage:
+        claude mcp add kb -- uv run kb mcp
+        claude mcp add kb -- uvx claude-kb@latest mcp
+    """
+    from .mcp import mcp as mcp_server
 
-        # Connect
-        db = QdrantDB(CONFIG["qdrant_url"], CONFIG["qdrant_api_key"], CONFIG["embedding_model"])
-        console.print(f"Qdrant: {CONFIG['qdrant_url']} [green]✓[/]")
-        console.print(f"Embedding: {CONFIG['embedding_model']}")
-        console.print()
-
-        # Get stats
-        stats = db.get_stats()
-
-        if not stats:
-            console.print("[yellow]No collections found. Run 'kb init' first.[/]")
-            sys.exit(1)
-
-        console.print("[bold]Collections:[/]")
-        for collection, count in stats.items():
-            # Format size (rough estimate: ~1KB per point with 768-dim vector)
-            size_mb = (count * 1) / 1024
-            console.print(f"  {collection:20} {count:6,} points  ({size_mb:.1f} MB)")
-
-        # Get per-project breakdown for conversations
-        if "conversations" in stats and stats["conversations"] > 0:
-            console.print()
-            console.print("[bold]Projects:[/]")
-
-            with console.status("[yellow]Analyzing projects...[/yellow]", spinner="dots"):
-                project_stats = db.get_project_stats("conversations")
-
-            if project_stats:
-                table = Table(show_header=True, header_style="bold cyan", box=None)
-                table.add_column("Project", style="dim", no_wrap=False)
-                table.add_column("Sessions", justify="right", style="green")
-                table.add_column("Messages", justify="right", style="blue")
-
-                total_sessions = 0
-                total_messages = 0
-
-                for proj in project_stats:
-                    # Shorten project path for display
-                    project_name = (
-                        proj["project"].split("/")[-1]
-                        if "/" in proj["project"]
-                        else proj["project"]
-                    )
-                    table.add_row(project_name, f"{proj['sessions']:,}", f"{proj['messages']:,}")
-                    total_sessions += proj["sessions"]
-                    total_messages += proj["messages"]
-
-                # Add total row
-                table.add_row(
-                    "[bold]TOTAL[/bold]",
-                    f"[bold]{total_sessions:,}[/bold]",
-                    f"[bold]{total_messages:,}[/bold]",
-                    style="bold",
-                )
-
-                console.print(table)
-
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/]")
-        logging.exception("Status failed")
-        sys.exit(2)
+    mcp_server.run(transport="stdio")
 
 
 # =============================================================================

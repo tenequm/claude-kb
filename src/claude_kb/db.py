@@ -1,9 +1,8 @@
-"""Core backend: Qdrant client with sentence-transformers on MPS."""
+"""Qdrant database client and embedding models."""
 
 import hashlib
 import logging
 from dataclasses import dataclass
-from typing import TypedDict
 
 import numpy as np
 from qdrant_client import AsyncQdrantClient, QdrantClient
@@ -14,11 +13,8 @@ from sentence_transformers import SentenceTransformer
 logger = logging.getLogger(__name__)
 
 
-# Type definitions
-class ProjectStats(TypedDict):
-    project: str
-    sessions: int
-    messages: int
+# Collection names
+COLLECTION_CONVERSATIONS = "conversations"
 
 
 @dataclass
@@ -30,25 +26,6 @@ class SparseEmbedding:
 
     indices: np.ndarray
     values: np.ndarray
-
-
-# =============================================================================
-# CONSTANTS
-# =============================================================================
-
-# Collection names
-COLLECTION_CONVERSATIONS = "conversations"
-
-# Content truncation
-MAX_CONTENT_PREVIEW_LENGTH = 1500  # Characters to show in search results (increased from 500)
-
-# Size estimation
-ESTIMATED_KB_PER_POINT = 1  # Rough estimate for 768-dim vector + metadata
-
-
-# =============================================================================
-# EMBEDDING MODEL
-# =============================================================================
 
 
 class EmbeddingModel:
@@ -196,11 +173,6 @@ class SparseEmbeddingModel:
         return results
 
 
-# =============================================================================
-# QDRANT CLIENT
-# =============================================================================
-
-
 class QdrantDB:
     """Qdrant vector database wrapper with sentence-transformers."""
 
@@ -232,7 +204,6 @@ class QdrantDB:
         Note: When using FastEmbed, collections are auto-created on first .add()
         with the correct vector configuration for the embedding model.
         """
-        # Just verify we can connect to Qdrant
         try:
             collections = self.client.get_collections()
             logger.info(
@@ -458,7 +429,7 @@ class QdrantDB:
             logger.error(f"Failed to get stats: {e}")
             return {}
 
-    def get_project_stats(self, collection: str = COLLECTION_CONVERSATIONS) -> list[ProjectStats]:
+    def get_project_stats(self, collection: str = COLLECTION_CONVERSATIONS) -> list[dict]:
         """
         Get per-project statistics (sessions and messages).
 
@@ -467,7 +438,7 @@ class QdrantDB:
         """
         try:
             # Scroll through all points and group by project
-            project_data = {}
+            project_data: dict[str, dict] = {}
             offset = None
 
             while True:
@@ -580,7 +551,6 @@ class AsyncQdrantDB:
         Note: When using FastEmbed, collections are auto-created on first .add()
         with the correct vector configuration for the embedding model.
         """
-        # Just verify we can connect to Qdrant
         try:
             collections = await self.client.get_collections()
             logger.info(
@@ -593,261 +563,6 @@ class AsyncQdrantDB:
     async def close(self) -> None:
         """Close the async client connection."""
         await self.client.close()
-
-
-# =============================================================================
-# FORMATTING
-# =============================================================================
-
-
-def clean_content(content: str | list | dict) -> str | list | dict:
-    """
-    Remove signature fields from content to reduce noise and token usage.
-
-    Signatures are cryptographic verification data that:
-    - Consume hundreds of base64 characters
-    - Provide zero semantic value for search/retrieval
-    - Make results harder to read
-
-    Args:
-        content: Content string, list, or dict
-
-    Returns:
-        Cleaned content with signatures removed
-    """
-    import json
-
-    if isinstance(content, str):
-        # Try to parse as JSON if it looks like JSON
-        if content.strip().startswith("[") or content.strip().startswith("{"):
-            try:
-                parsed = json.loads(content)
-                cleaned = clean_content(parsed)
-                return (
-                    json.dumps(cleaned, indent=2) if isinstance(cleaned, dict | list) else content
-                )
-            except (json.JSONDecodeError, ValueError):
-                return content
-        return content
-    elif isinstance(content, list):
-        return [clean_content(item) for item in content]
-    elif isinstance(content, dict):
-        # Remove 'signature' key recursively
-        return {k: clean_content(v) for k, v in content.items() if k != "signature"}
-    return content
-
-
-def format_search_results(results, collection: str, show_tokens: bool = False) -> str:
-    """
-    Format search results as structured text for LLM parsing.
-
-    Output format:
-    === id (score: 0.95) ===
-    Field: value
-    Field: value
-
-    Content preview...
-    ---
-
-    Args:
-        results: List of QueryResponse objects from client.query()
-        collection: Collection name
-        show_tokens: Whether to display token counts
-
-    Returns:
-        Formatted string
-    """
-    if not results:
-        return "No results found."
-
-    output = []
-    total_tokens = 0
-
-    for result in results:
-        # Handle both QueryResponse (from client.query) and ScoredPoint (from client.search)
-        if hasattr(result, "metadata"):
-            payload = result.metadata
-            score = result.score
-            point_id = result.id
-        else:
-            payload = result.payload
-            if payload is None:
-                continue  # Skip results without payload
-            score = result.score
-            point_id = payload.get("message_id") or payload.get("id") or str(result.id)
-
-        lines = [f"=== {point_id} (score: {score:.2f}) ==="]
-
-        if collection.startswith("conversations"):
-            lines.append(f"Role: {payload.get('role', 'unknown')}")
-            lines.append(f"Time: {payload.get('timestamp', 'N/A')}")
-            lines.append(f"Project: {payload.get('project_path', 'N/A')}")
-
-            # Clean signatures from content
-            content = clean_content(payload.get("content", ""))
-            content = str(content) if not isinstance(content, str) else content
-
-            # Count tokens if requested
-            if show_tokens:
-                token_count = count_tokens(content)
-                total_tokens += token_count
-                lines.append(f"Tokens: {token_count:,}")
-
-            lines.append("")
-
-            # Truncate long content
-            if len(content) > MAX_CONTENT_PREVIEW_LENGTH:
-                lines.append(content[:MAX_CONTENT_PREVIEW_LENGTH] + "...")
-            else:
-                lines.append(content)
-
-        else:
-            # Generic format
-            lines.append(str(payload))
-
-        lines.append("---")
-        output.append("\n".join(lines))
-
-    # Add total token count if requested
-    if show_tokens and total_tokens > 0:
-        output.append(f"\n=== Total: {len(results)} results, {total_tokens:,} tokens ===")
-
-    return "\n".join(output)
-
-
-def format_thread_context(messages: list, target_id: str, collection: str, depth: int) -> str:
-    """
-    Format thread context showing messages before/after target.
-
-    Args:
-        messages: List of Point objects in chronological order
-        target_id: ID of the target message (highlighted)
-        collection: Collection name
-        depth: Depth setting for context
-
-    Returns:
-        Formatted string with thread context
-    """
-    if not messages:
-        return "No messages found in thread."
-
-    output = []
-    output.append(f"=== Thread Context (±{depth} messages) ===")
-    output.append("")
-
-    for i, point in enumerate(messages):
-        payload = point.payload or {}
-        point_id = payload.get("message_id") or str(point.id)
-        is_target = point_id == target_id or str(point.id) == target_id
-
-        # Marker for target message
-        marker = ">>> TARGET <<<" if is_target else f"[{i + 1}/{len(messages)}]"
-
-        output.append(f"--- {marker} ---")
-        output.append(f"ID: {point_id}")
-        output.append(f"Role: {payload.get('role', 'unknown')}")
-        output.append(f"Time: {payload.get('timestamp', 'N/A')}")
-
-        if is_target:
-            output.append(f"Project: {payload.get('project_path', 'N/A')}")
-
-        output.append("")
-
-        # Clean and display content
-        content = clean_content(payload.get("content", ""))
-        content = str(content) if not isinstance(content, str) else content
-
-        # For target message, show more content
-        max_length = 2000 if is_target else 800
-        if len(content) > max_length:
-            output.append(content[:max_length] + f"... [{len(content) - max_length} chars more]")
-        else:
-            output.append(content)
-
-        output.append("")
-
-    # Summary footer
-    first_payload = messages[0].payload or {}
-    conv_id = first_payload.get("conversation_id", "unknown")
-    output.append("---")
-    output.append(f"Conversation: {conv_id}")
-    output.append(f"Total messages in thread: {len(messages)}")
-
-    return "\n".join(output)
-
-
-def format_get_result(point, collection: str) -> str:
-    """
-    Format single item for get command.
-
-    Args:
-        point: Point object
-        collection: Collection name
-
-    Returns:
-        Formatted string
-    """
-    if not point:
-        return "Not found."
-
-    payload = point.payload
-    if payload is None:
-        return f"=== {point.id} (no payload) ==="
-
-    point_id = payload.get("message_id") or payload.get("id") or str(point.id)
-
-    lines = [f"=== {point_id} ==="]
-
-    if collection == "conversations":
-        lines.append("Type: conversation/message")
-        lines.append(f"Role: {payload.get('role', 'unknown')}")
-        lines.append(f"Time: {payload.get('timestamp', 'N/A')}")
-        lines.append(f"Conversation: {payload.get('conversation_id', 'N/A')}")
-        lines.append(f"Project: {payload.get('project_path', 'N/A')}")
-        lines.append("")
-        # Clean signatures from content
-        content = clean_content(payload.get("content", ""))
-        content = str(content) if not isinstance(content, str) else content
-        lines.append(content)
-        lines.append("")
-
-        # Related messages
-        parent_id = payload.get("parent_message_id")
-        if parent_id:
-            lines.append("Related:")
-            lines.append(f"  Parent: {parent_id}")
-
-    else:
-        # Generic format for unknown collections
-        lines.append(str(payload))
-
-    return "\n".join(lines)
-
-
-# =============================================================================
-# UTILITIES
-# =============================================================================
-
-
-def count_tokens(text: str) -> int:
-    """
-    Count tokens using tiktoken cl100k_base encoding (GPT-4/Claude compatible).
-
-    Args:
-        text: Text to count tokens for
-
-    Returns:
-        Number of tokens
-    """
-    import tiktoken
-
-    try:
-        encoding = tiktoken.get_encoding("cl100k_base")
-        return len(encoding.encode(text))
-    except Exception as e:
-        logger.warning(f"Failed to count tokens: {e}")
-        # Fallback: rough estimate (4 chars per token)
-        return len(text) // 4
 
 
 def generate_id(content: str, type_prefix: str) -> str:

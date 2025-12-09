@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2025-12-09
+
+### Added
+- MCP server capability via `kb mcp` command for Claude Code integration
+- FastMCP integration with 2 tools (`search`, `get`) and 2 resources (`schema://kb`, `stats://kb`)
+- Hybrid search combining dense semantic vectors with sparse BM25-style keyword matching
+- Recency boosting with exponential decay for search results
+- `kb migrate` command to upgrade existing collections to hybrid search
+- Pydantic models for structured outputs shared between CLI and MCP
+- Service layer (`SearchService`) for business logic reuse
+- Centralized configuration module (`config.py`)
+- SparseEncoder for MPS-accelerated sparse embeddings on Apple Silicon
+
+### Changed
+- Restructured codebase: split monolithic `core.py` into `db.py`, `search.py`, `formatters.py`, `models.py`, `config.py`
+- Slimmed `cli.py` by delegating to service layer
+- Version now retrieved via `importlib.metadata` instead of `__init__.py`
+- Replaced FastEmbed with SparseEncoder for better MPS compatibility
+- Collection detection now uses `startswith` for conversations collection matching
+
+### Removed
+- `__init__.py` (no longer needed with modern Python packaging)
+- FastEmbed dependency (replaced with sentence-transformers SparseEncoder)
+
+### Fixed
+- Collection check now properly detects `conversations_hybrid` collection
+
+### Migration
+To enable hybrid search on existing data, run:
+```bash
+kb migrate --dry-run  # Preview changes
+kb migrate            # Run migration (time varies by collection size)
+```
+This creates a new `conversations_hybrid` collection with both dense and sparse vectors. The original `conversations` collection is preserved as backup.
+
 ## [0.1.1] - 2025-11-19
 
 ### Fixed
@@ -28,6 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Docker Compose setup for local Qdrant
 - Pre-commit hooks with secret detection
 
-[Unreleased]: https://github.com/tenequm/claude-kb/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/tenequm/claude-kb/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/tenequm/claude-kb/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/tenequm/claude-kb/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/tenequm/claude-kb/releases/tag/v0.1.0
