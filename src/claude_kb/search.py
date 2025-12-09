@@ -100,8 +100,8 @@ class SearchService:
             # Build Qdrant filter
             query_filter = self._build_filter(project, role, conversation)
 
-            # Search (fetch extra for filtering: dates, thinking-only messages)
-            search_limit = limit * 3 if (from_date or to_date) else limit * 2
+            # Search (fetch extra only for date filtering which happens client-side)
+            search_limit = limit * 3 if (from_date or to_date) else limit
             results = self.db.search(
                 query_vector=query_vector.tolist(),
                 collection=self.collection,
@@ -119,14 +119,8 @@ class SearchService:
             if boost_recent and results:
                 results = self._apply_recency_boost(results)
 
-            # Convert to Pydantic models
-            messages = [self._to_message(r) for r in results]
-
-            # Filter out thinking-only messages (useless in search results)
-            messages = [m for m in messages if m.content != "[assistant thinking - no text output]"]
-
-            # Apply limit after filtering
-            messages = messages[:limit]
+            # Convert to Pydantic models and limit
+            messages = [self._to_message(r) for r in results[:limit]]
 
             return SearchResult(
                 query=query,
@@ -324,46 +318,35 @@ class SearchService:
 
     def _clean_content(self, content: str | list | dict) -> str:
         """
-        Extract clean text from content, removing signatures and JSON structure.
+        Clean content by removing only signatures (useless base64 noise).
 
-        Handles Claude's content format: [{"type": "text", "text": "..."}, ...]
+        Preserves all semantic content including tool calls, thinking, etc.
+        for search result explainability.
         """
-        import ast
         import json
 
-        # Parse JSON or Python literal string if needed
+        def remove_signatures(obj):
+            """Recursively remove 'signature' keys from nested structures."""
+            if isinstance(obj, dict):
+                return {k: remove_signatures(v) for k, v in obj.items() if k != "signature"}
+            elif isinstance(obj, list):
+                return [remove_signatures(item) for item in obj]
+            return obj
+
+        # Parse JSON string if needed
         if isinstance(content, str):
             if content.strip().startswith("[") or content.strip().startswith("{"):
                 try:
-                    content = json.loads(content)
+                    parsed = json.loads(content)
+                    cleaned = remove_signatures(parsed)
+                    return json.dumps(cleaned, indent=2)
                 except (json.JSONDecodeError, ValueError):
-                    # Try Python literal (single quotes)
-                    try:
-                        content = ast.literal_eval(content)
-                    except (ValueError, SyntaxError):
-                        return content
+                    return content
+            return content
 
-        # Extract text from content blocks
-        if isinstance(content, list):
-            texts = []
-            for block in content:
-                if isinstance(block, dict):
-                    # Skip thinking blocks and blocks with only signatures
-                    if block.get("type") == "thinking":
-                        continue
-                    # Extract text (skip signature field)
-                    if "text" in block:
-                        texts.append(block["text"])
-                elif isinstance(block, str):
-                    texts.append(block)
-            # Return extracted text, or "[thinking only]" if nothing useful
-            return "\n".join(texts) if texts else "[assistant thinking - no text output]"
-
-        if isinstance(content, dict):
-            # Remove signature and extract text
-            if "text" in content:
-                return content["text"]
-            cleaned = {k: v for k, v in content.items() if k != "signature"}
+        # Handle list/dict directly
+        if isinstance(content, list | dict):
+            cleaned = remove_signatures(content)
             return json.dumps(cleaned, indent=2)
 
         return str(content)
