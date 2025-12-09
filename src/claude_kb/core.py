@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+from dataclasses import dataclass
 from typing import TypedDict
 
 import numpy as np
@@ -18,6 +19,17 @@ class ProjectStats(TypedDict):
     project: str
     sessions: int
     messages: int
+
+
+@dataclass
+class SparseEmbedding:
+    """Sparse embedding result with indices and values arrays.
+
+    Compatible with FastEmbed output format for seamless migration.
+    """
+
+    indices: np.ndarray
+    values: np.ndarray
 
 
 # =============================================================================
@@ -110,14 +122,18 @@ class EmbeddingModel:
 
 
 class SparseEmbeddingModel:
-    """SPLADE sparse embedding model via FastEmbed for hybrid search."""
+    """SPLADE sparse embedding model via sentence-transformers with MPS/CUDA support.
+
+    Uses SparseEncoder which automatically detects and uses the best available
+    device (MPS on Apple Silicon, CUDA on NVIDIA, or CPU).
+    """
 
     def __init__(self, model_name: str = "prithivida/Splade_PP_en_v1"):
         """
         Initialize sparse embedding model.
 
         Args:
-            model_name: FastEmbed sparse model name
+            model_name: HuggingFace model name for SPLADE
         """
         self.model_name = model_name
         self._model = None
@@ -127,13 +143,20 @@ class SparseEmbeddingModel:
         if self._model is not None:
             return
 
+        from sentence_transformers import SparseEncoder
+
         logger.info(f"Loading sparse embedding model: {self.model_name}")
-        from fastembed import SparseTextEmbedding
+        self._model = SparseEncoder(self.model_name)
 
-        self._model = SparseTextEmbedding(self.model_name)
-        logger.info("✓ Sparse model loaded")
+        device_str = str(self._model.device).lower()
+        if "mps" in device_str:
+            logger.info("✓ Using Apple Silicon GPU (MPS) for sparse embeddings")
+        elif "cuda" in device_str:
+            logger.info("✓ Using NVIDIA GPU (CUDA) for sparse embeddings")
+        else:
+            logger.info(f"Using CPU for sparse embeddings: {device_str}")
 
-    def encode(self, texts: list[str]) -> list:
+    def encode(self, texts: list[str]) -> list[SparseEmbedding]:
         """
         Generate sparse embeddings for texts.
 
@@ -141,13 +164,36 @@ class SparseEmbeddingModel:
             texts: List of text strings
 
         Returns:
-            List of SparseEmbedding objects with indices and values
+            List of SparseEmbedding objects with indices and values arrays
         """
         if self._model is None:
             self.load()
 
         assert self._model is not None  # Guaranteed by load()
-        return list(self._model.embed(texts))
+
+        # Get dense output - sparse COO tensors don't work on MPS
+        embeddings = self._model.encode(
+            texts,
+            convert_to_sparse_tensor=False,
+            show_progress_bar=False,
+        )
+
+        # Extract sparse representations
+        results = []
+        for vec in embeddings:
+            # Convert to numpy if tensor
+            if hasattr(vec, "cpu"):
+                vec = vec.cpu().numpy()
+
+            # Get non-zero indices and values
+            nonzero_indices = np.nonzero(vec)[0]
+            results.append(
+                SparseEmbedding(
+                    indices=nonzero_indices.astype(np.int32),
+                    values=vec[nonzero_indices].astype(np.float32),
+                )
+            )
+        return results
 
 
 # =============================================================================
