@@ -375,7 +375,7 @@ def search(
                 point_id = payload.get("message_id") or payload.get("id") or str(result.id)
 
                 console.print(f"=== {point_id} (score: {result.score:.2f}) ===")
-                if collection == "conversations":
+                if collection.startswith("conversations"):
                     console.print(f"Role: {payload.get('role', 'unknown')}")
                     console.print(f"Time: {payload.get('timestamp', 'N/A')}")
                     console.print(f"Project: {payload.get('project_path', 'N/A')}")

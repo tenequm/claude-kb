@@ -632,7 +632,7 @@ def format_search_results(results, collection: str, show_tokens: bool = False) -
 
         lines = [f"=== {point_id} (score: {score:.2f}) ==="]
 
-        if collection == COLLECTION_CONVERSATIONS:
+        if collection.startswith("conversations"):
             lines.append(f"Role: {payload.get('role', 'unknown')}")
             lines.append(f"Time: {payload.get('timestamp', 'N/A')}")
             lines.append(f"Project: {payload.get('project_path', 'N/A')}")
