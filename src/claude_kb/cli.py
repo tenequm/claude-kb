@@ -17,7 +17,7 @@ from rich.console import Console
 from .config import get_config
 from .db import AsyncQdrantDB, QdrantDB
 from .formatters import format_get, format_search, format_status, format_thread
-from .models import ErrorResult
+from .models import ErrorResult, GetResult, SearchResult, StatusResult
 from .search import SearchService
 
 load_dotenv()
@@ -159,6 +159,7 @@ def search(
             console.print(f"[red]Error: {result.error}[/]")
             sys.exit(2)
 
+        assert isinstance(result, SearchResult)
         console.print(format_search(result, show_tokens=show_tokens))
 
         if result.count == 0:
@@ -192,6 +193,7 @@ def get(message_id, context_window):
             console.print(f"[red]{result.error}[/]")
             sys.exit(1)
 
+        assert isinstance(result, GetResult)
         console.print(format_get(result, context_window=context_window))
 
     except Exception as e:
@@ -222,6 +224,7 @@ def get_thread(message_id, depth):
             console.print(f"[red]{result.error}[/]")
             sys.exit(1)
 
+        assert isinstance(result, GetResult)
         console.print(format_thread(result))
 
     except Exception as e:
@@ -251,6 +254,7 @@ def status():
             console.print(f"[red]Error: {result.error}[/]")
             sys.exit(2)
 
+        assert isinstance(result, StatusResult)
         console.print(format_status(result))
 
     except Exception as e:
@@ -364,11 +368,16 @@ def migrate(collection, batch_size, dry_run):
             return
 
         # Get vector dimension from existing collection
+        from qdrant_client.models import VectorParams
+
         if isinstance(vectors, dict):
             first_vec = list(vectors.values())[0]
             vector_dim = first_vec.size
-        else:
+        elif isinstance(vectors, VectorParams):
             vector_dim = vectors.size
+        else:
+            console.print("[red]Unknown vector configuration type[/]")
+            sys.exit(1)
 
         console.print(f"Vector dimension: {vector_dim}")
         console.print()
@@ -515,16 +524,41 @@ def migrate(collection, batch_size, dry_run):
 
 
 @main.command()
-def mcp():
+@click.option(
+    "--transport",
+    type=click.Choice(["stdio", "http"]),
+    default="stdio",
+    help="Transport: stdio (default) or http (Streamable HTTP)",
+)
+@click.option("--host", default="127.0.0.1", help="HTTP host (default: 127.0.0.1)")
+@click.option("--port", default=8000, type=int, help="HTTP port (default: 8000)")
+def mcp(transport: str, host: str, port: int):
     """Run as MCP server for Claude Code integration.
 
-    Usage:
-        claude mcp add kb -- uv run kb mcp
-        claude mcp add kb -- uvx claude-kb@latest mcp
-    """
-    from .mcp import mcp as mcp_server
+    Examples:
 
-    mcp_server.run(transport="stdio")
+    \b
+        # stdio transport (default, for Claude Code)
+        claude mcp add kb -- uv run kb mcp
+
+    \b
+        # Streamable HTTP transport
+        uv run kb mcp --transport http
+
+    \b
+        # HTTP with custom port
+        uv run kb mcp --transport http --port 3000
+    """
+    from .mcp import _register_tools, create_server
+
+    if transport == "stdio":
+        from .mcp import mcp as mcp_server
+
+        mcp_server.run(transport="stdio")
+    else:
+        server = create_server(host=host, port=port, json_response=True, stateless=True)
+        _register_tools(server)
+        server.run(transport="streamable-http")
 
 
 # =============================================================================

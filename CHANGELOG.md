@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2025-12-11
+
+### Added
+- HTTP transport support for MCP server via `kb mcp --transport http`
+- Tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`)
+- Server and tool icons (SVG data URIs) for MCP clients
+- `Literal["user", "assistant"]` type for role parameter with schema validation
+- Server factory function `create_server()` for configurable MCP instantiation
+- Click CLI with `--transport`, `--host`, `--port` options for MCP command
+
+### Changed
+- MCP server now uses latest protocol version (2025-11-25)
+- Improved type safety throughout CLI and database modules
+
+### Fixed
+- Type narrowing issues in CLI commands with proper assertions
+- Tensor conversion type safety in sparse embedding encoder
+
 ## [0.2.0] - 2025-12-09
 
 ### Added
@@ -63,7 +81,8 @@ This creates a new `conversations_hybrid` collection with both dense and sparse 
 - Docker Compose setup for local Qdrant
 - Pre-commit hooks with secret detection
 
-[Unreleased]: https://github.com/tenequm/claude-kb/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/tenequm/claude-kb/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/tenequm/claude-kb/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/tenequm/claude-kb/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/tenequm/claude-kb/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/tenequm/claude-kb/releases/tag/v0.1.0

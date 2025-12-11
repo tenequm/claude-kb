@@ -158,16 +158,22 @@ class SparseEmbeddingModel:
         # Extract sparse representations
         results = []
         for vec in embeddings:
-            # Convert to numpy if tensor
+            # Convert to numpy array
+            arr: np.ndarray
             if hasattr(vec, "cpu"):
-                vec = vec.cpu().numpy()
+                # PyTorch tensor - move to CPU and convert to numpy
+                arr = vec.cpu().numpy()  # type: ignore[union-attr]
+            elif isinstance(vec, np.ndarray):
+                arr = vec
+            else:
+                arr = np.array(vec)
 
             # Get non-zero indices and values
-            nonzero_indices = np.nonzero(vec)[0]
+            nonzero_indices = np.nonzero(arr)[0]
             results.append(
                 SparseEmbedding(
                     indices=nonzero_indices.astype(np.int32),
-                    values=vec[nonzero_indices].astype(np.float32),
+                    values=arr[nonzero_indices].astype(np.float32),
                 )
             )
         return results
