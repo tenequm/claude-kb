@@ -4,7 +4,7 @@ version = "0.2.2"
 description = "Universal knowledge base with Qdrant for Claude Code integration"
 readme = "README.md"
 requires-python = ">=3.13"
-authors = [{name = "Artem Khramov", email = "tenequm@gmail.com"}]
+authors = [{name = "Misha Kolesnik", email = "misha@kolesnik.io"}]
 license = {text = "MIT"}
 keywords = ["knowledge-base", "qdrant", "vector-search", "semantic-search", "claude", "ai", "embeddings"]
 classifiers = [
