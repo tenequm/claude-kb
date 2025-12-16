@@ -76,12 +76,12 @@ GET_ANNOTATIONS = ToolAnnotations(
 SERVER_INSTRUCTIONS = """Knowledge base for Claude Code conversation history.
 
 Tools:
-- search: Semantic search across conversations (hybrid dense+sparse vectors)
-- get: Retrieve message by ID, optionally with thread context
+- kb_search: Semantic search across conversations (hybrid dense+sparse vectors)
+- kb_get: Retrieve message by ID, optionally with thread context
 
-Workflow: search → get(id) for full content or get(id, context_depth=N) for thread
+Workflow: kb_search → kb_get(id) for full content or kb_get(id, context_depth=N) for thread
 
-Filtering options for search:
+Filtering options for kb_search:
 - project: Partial match on project path
 - from_date/to_date: ISO format (YYYY-MM-DD)
 - role: "user" or "assistant"
@@ -132,7 +132,7 @@ def get_service() -> SearchService:
     annotations=SEARCH_ANNOTATIONS,
     icons=[ICON_SEARCH],
 )
-def search(
+def kb_search(
     query: str,
     limit: int = 10,
     project: str | None = None,
@@ -176,7 +176,7 @@ def search(
     annotations=GET_ANNOTATIONS,
     icons=[ICON_GET],
 )
-def get(
+def kb_get(
     message_id: str,
     context_depth: int = 0,
 ) -> GetResult | ErrorResult:
@@ -215,9 +215,9 @@ def get_schema() -> str:
 - min_score: 0.0-1.0 relevance threshold
 
 ## Examples
-- Find error discussions: search("error handling", project="my-app")
-- Recent assistant responses: search("implementation", role="assistant", from_date="2024-12-01")
-- Get message with context: get("message-id", context_depth=3)
+- Find error discussions: kb_search("error handling", project="my-app")
+- Recent assistant responses: kb_search("implementation", role="assistant", from_date="2024-12-01")
+- Get message with context: kb_get("message-id", context_depth=3)
 """
 
 
@@ -246,8 +246,8 @@ def get_stats() -> str:
 
 def _register_tools(server: FastMCP):
     """Register all tools on a server instance."""
-    server.add_tool(search, annotations=SEARCH_ANNOTATIONS, icons=[ICON_SEARCH])
-    server.add_tool(get, annotations=GET_ANNOTATIONS, icons=[ICON_GET])
+    server.add_tool(kb_search, annotations=SEARCH_ANNOTATIONS, icons=[ICON_SEARCH])
+    server.add_tool(kb_get, annotations=GET_ANNOTATIONS, icons=[ICON_GET])
 
 
 @click.command()

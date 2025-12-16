@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2025-12-16
+
+### Changed
+- Renamed MCP tools to include `kb_` prefix: `search` → `kb_search`, `get` → `kb_get`
+
 ## [0.3.0] - 2025-12-11
 
 ### Added
@@ -81,7 +86,8 @@ This creates a new `conversations_hybrid` collection with both dense and sparse 
 - Docker Compose setup for local Qdrant
 - Pre-commit hooks with secret detection
 
-[Unreleased]: https://github.com/tenequm/claude-kb/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/tenequm/claude-kb/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/tenequm/claude-kb/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/tenequm/claude-kb/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/tenequm/claude-kb/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/tenequm/claude-kb/compare/v0.1.0...v0.1.1
