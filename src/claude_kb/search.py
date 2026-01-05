@@ -8,7 +8,16 @@ from qdrant_client.models import FieldCondition, Filter, MatchText, MatchValue
 
 from .config import get_config
 from .db import QdrantDB
-from .models import ErrorResult, GetResult, Message, ProjectStats, SearchResult, StatusResult
+from .models import (
+    ConversationSearchResult,
+    ConversationSummary,
+    ErrorResult,
+    GetResult,
+    Message,
+    ProjectStats,
+    SearchResult,
+    StatusResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +64,10 @@ class SearchService:
         conversation: str | None = None,
         min_score: float = 0.5,
         boost_recent: bool = True,
-    ) -> SearchResult | ErrorResult:
+        include_tool_results: bool = False,
+        include_thinking: bool = False,
+        group_by_conversation: bool = False,
+    ) -> SearchResult | ConversationSearchResult | ErrorResult:
         """
         Semantic search with filtering and recency boosting.
 
@@ -69,9 +81,13 @@ class SearchService:
             conversation: Filter by conversation ID (exact match)
             min_score: Minimum relevance score threshold (0.0-1.0)
             boost_recent: Whether to boost recent messages in ranking
+            include_tool_results: Include full tool result content (default False)
+            include_thinking: Include thinking block content (default False)
+            group_by_conversation: Group results by conversation (default False)
 
         Returns:
-            SearchResult with Message objects, or ErrorResult on failure.
+            SearchResult with Message objects, ConversationSearchResult if grouped,
+            or ErrorResult on failure.
         """
         try:
             # Suppress INFO logs from db module (model loading messages)
@@ -100,8 +116,14 @@ class SearchService:
             # Build Qdrant filter
             query_filter = self._build_filter(project, role, conversation)
 
-            # Search (fetch extra only for date filtering which happens client-side)
-            search_limit = limit * 3 if (from_date or to_date) else limit
+            # For conversation grouping, fetch more results to ensure good coverage
+            if group_by_conversation:
+                search_limit = limit * 10  # Fetch more to group effectively
+            elif from_date or to_date:
+                search_limit = limit * 3
+            else:
+                search_limit = limit
+
             results = self.db.search(
                 query_vector=query_vector.tolist(),
                 collection=self.collection,
@@ -119,8 +141,19 @@ class SearchService:
             if boost_recent and results:
                 results = self._apply_recency_boost(results)
 
+            # Group by conversation if requested
+            if group_by_conversation:
+                return self._group_by_conversation(query, results, limit)
+
             # Convert to Pydantic models and limit
-            messages = [self._to_message(r) for r in results[:limit]]
+            messages = [
+                self._to_message(
+                    r,
+                    include_tool_results=include_tool_results,
+                    include_thinking=include_thinking,
+                )
+                for r in results[:limit]
+            ]
 
             return SearchResult(
                 query=query,
@@ -137,6 +170,8 @@ class SearchService:
         self,
         message_id: str,
         context_depth: int = 0,
+        include_tool_results: bool = False,
+        include_thinking: bool = False,
     ) -> GetResult | ErrorResult:
         """
         Retrieve message by ID with optional thread context.
@@ -144,6 +179,8 @@ class SearchService:
         Args:
             message_id: Message ID to retrieve
             context_depth: If > 0, include ±N surrounding messages
+            include_tool_results: Include full tool result content (default False)
+            include_thinking: Include thinking block content (default False)
 
         Returns:
             GetResult with message and optional thread context.
@@ -161,7 +198,11 @@ class SearchService:
                 target = None
                 thread = []
                 for point in thread_points:
-                    msg = self._point_to_message(point)
+                    msg = self._point_to_message(
+                        point,
+                        include_tool_results=include_tool_results,
+                        include_thinking=include_thinking,
+                    )
                     if msg.id == message_id or str(point.id) == message_id:
                         target = msg
                     thread.append(msg)
@@ -179,7 +220,13 @@ class SearchService:
                 if point is None:
                     return ErrorResult(error=f"Message not found: {message_id}")
 
-                return GetResult(message=self._point_to_message(point))
+                return GetResult(
+                    message=self._point_to_message(
+                        point,
+                        include_tool_results=include_tool_results,
+                        include_thinking=include_thinking,
+                    )
+                )
 
         except Exception as e:
             logger.exception("Get failed")
@@ -316,21 +363,218 @@ class SearchService:
 
         return [BoostedResult(r, score) for score, r in boosted]
 
-    def _clean_content(self, content: str | list | dict) -> str:
+    def _group_by_conversation(
+        self, query: str, results: list, limit: int
+    ) -> ConversationSearchResult:
         """
-        Clean content by removing only signatures (useless base64 noise).
+        Group search results by conversation_id.
 
-        Preserves all semantic content including tool calls, thinking, etc.
-        for search result explainability.
+        Args:
+            query: Original search query
+            results: Search results to group
+            limit: Maximum number of conversations to return
+
+        Returns:
+            ConversationSearchResult with conversation summaries
+        """
+        from collections import defaultdict
+
+        # Group results by conversation_id
+        conversations: dict[str, list] = defaultdict(list)
+        for result in results:
+            conv_id = result.payload.get("conversation_id")
+            if conv_id:
+                conversations[conv_id].append(result)
+
+        # Build conversation summaries
+        summaries = []
+        for conv_id, messages in conversations.items():
+            # Sort messages by timestamp
+            messages.sort(key=lambda m: m.payload.get("timestamp", ""))
+
+            # Get timestamps
+            timestamps = []
+            for msg in messages:
+                ts_str = msg.payload.get("timestamp", "")
+                try:
+                    if "+" in ts_str or ts_str.endswith("Z"):
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    else:
+                        ts = datetime.fromisoformat(ts_str).replace(tzinfo=UTC)
+                    timestamps.append(ts)
+                except (ValueError, TypeError):
+                    pass
+
+            if not timestamps:
+                continue
+
+            # Get best score (highest relevance)
+            best_score = max(m.score for m in messages)
+
+            # Get preview from first matching message content
+            first_content = messages[0].payload.get("content", "")
+            preview = self._extract_preview(first_content, max_length=200)
+
+            # Get project from first message
+            project = messages[0].payload.get("project_path", "N/A")
+
+            # Get total message count for this conversation from DB
+            # (messages list only contains matches, not full conversation)
+            message_count = self._get_conversation_message_count(conv_id)
+
+            summaries.append(
+                ConversationSummary(
+                    conversation_id=conv_id,
+                    project=project,
+                    first_timestamp=min(timestamps),
+                    last_timestamp=max(timestamps),
+                    message_count=message_count,
+                    preview=preview,
+                    best_score=best_score,
+                )
+            )
+
+        # Sort by best_score descending
+        summaries.sort(key=lambda s: s.best_score, reverse=True)
+
+        # Limit results
+        summaries = summaries[:limit]
+
+        return ConversationSearchResult(
+            query=query,
+            collection=self.collection,
+            count=len(summaries),
+            conversations=summaries,
+        )
+
+    def _extract_preview(self, content: str | list | dict, max_length: int = 200) -> str:
+        """Extract a text preview from message content."""
+        import json
+
+        # Handle structured content (list of content blocks)
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text", "")
+                    if text:
+                        return text[:max_length] + ("..." if len(text) > max_length else "")
+            # No text block found, return summary
+            return f"[{len(content)} content blocks]"
+
+        if isinstance(content, dict):
+            # Try to get text from dict
+            if "text" in content:
+                text = content["text"]
+                return str(text)[:max_length] + ("..." if len(str(text)) > max_length else "")
+            # Return type indicator if available
+            content_type = content.get("type", "unknown")
+            return f"[{content_type} content]"
+
+        # Plain string
+        if isinstance(content, str):
+            # Try to parse as JSON first (only once, don't recurse)
+            if content.strip().startswith("[") or content.strip().startswith("{"):
+                try:
+                    parsed = json.loads(content)
+                    # Extract from parsed structure without recursion
+                    if isinstance(parsed, list):
+                        for item in parsed:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                text = item.get("text", "")
+                                if text:
+                                    return text[:max_length] + (
+                                        "..." if len(text) > max_length else ""
+                                    )
+                        return f"[{len(parsed)} content blocks]"
+                    elif isinstance(parsed, dict) and "text" in parsed:
+                        text = parsed["text"]
+                        return str(text)[:max_length] + (
+                            "..." if len(str(text)) > max_length else ""
+                        )
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            return content[:max_length] + ("..." if len(content) > max_length else "")
+
+        return str(content)[:max_length]
+
+    def _get_conversation_message_count(self, conversation_id: str) -> int:
+        """Get total message count for a conversation."""
+        try:
+            # Use scroll with filter to count messages in conversation
+            count = 0
+            offset = None
+            while True:
+                results = self.db.client.scroll(
+                    collection_name=self.collection,
+                    scroll_filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="conversation_id", match=MatchValue(value=conversation_id)
+                            )
+                        ]
+                    ),
+                    limit=100,
+                    offset=offset,
+                    with_payload=False,  # Don't need payload, just counting
+                )
+                points, offset = results
+                count += len(points)
+                if offset is None or not points:
+                    break
+            return count
+        except Exception:
+            return 0  # Return 0 if we can't count
+
+    def _clean_content(
+        self,
+        content: str | list | dict,
+        include_tool_results: bool = True,
+        include_thinking: bool = True,
+    ) -> str:
+        """
+        Clean content by removing signatures and optionally filtering heavy content.
+
+        Args:
+            content: Raw message content (string, list, or dict)
+            include_tool_results: If False, replace tool_result content with summary
+            include_thinking: If False, replace thinking block content with summary
+
+        Returns:
+            Cleaned content string (JSON for structured content)
         """
         import json
 
-        def remove_signatures(obj):
-            """Recursively remove 'signature' keys from nested structures."""
+        def clean_item(obj):
+            """Recursively clean content items."""
             if isinstance(obj, dict):
-                return {k: remove_signatures(v) for k, v in obj.items() if k != "signature"}
+                # Remove signatures
+                obj = {k: v for k, v in obj.items() if k != "signature"}
+
+                # Handle tool_result blocks
+                if obj.get("type") == "tool_result" and not include_tool_results:
+                    result_content = obj.get("content", "")
+                    content_len = len(str(result_content))
+                    return {
+                        "type": "tool_result",
+                        "tool_use_id": obj.get("tool_use_id"),
+                        "content": f"[tool result: {content_len} chars]",
+                    }
+
+                # Handle thinking blocks
+                if obj.get("type") == "thinking" and not include_thinking:
+                    thinking_content = obj.get("thinking", "")
+                    content_len = len(str(thinking_content))
+                    return {
+                        "type": "thinking",
+                        "thinking": f"[thinking: {content_len} chars]",
+                    }
+
+                # Recurse for other dicts
+                return {k: clean_item(v) for k, v in obj.items()}
+
             elif isinstance(obj, list):
-                return [remove_signatures(item) for item in obj]
+                return [clean_item(item) for item in obj]
+
             return obj
 
         # Parse JSON string if needed
@@ -338,7 +582,7 @@ class SearchService:
             if content.strip().startswith("[") or content.strip().startswith("{"):
                 try:
                     parsed = json.loads(content)
-                    cleaned = remove_signatures(parsed)
+                    cleaned = clean_item(parsed)
                     return json.dumps(cleaned, indent=2)
                 except (json.JSONDecodeError, ValueError):
                     return content
@@ -346,12 +590,17 @@ class SearchService:
 
         # Handle list/dict directly
         if isinstance(content, list | dict):
-            cleaned = remove_signatures(content)
+            cleaned = clean_item(content)
             return json.dumps(cleaned, indent=2)
 
         return str(content)
 
-    def _to_message(self, result) -> Message:
+    def _to_message(
+        self,
+        result,
+        include_tool_results: bool = True,
+        include_thinking: bool = True,
+    ) -> Message:
         """Convert search result to Message model."""
         payload = result.payload
         point_id = payload.get("message_id") or payload.get("id") or str(result.id)
@@ -369,7 +618,11 @@ class SearchService:
         return Message(
             id=point_id,
             role=payload.get("role", "unknown"),
-            content=self._clean_content(payload.get("content", "")),
+            content=self._clean_content(
+                payload.get("content", ""),
+                include_tool_results=include_tool_results,
+                include_thinking=include_thinking,
+            ),
             timestamp=timestamp,
             project=payload.get("project_path", "N/A"),
             conversation_id=payload.get("conversation_id"),
@@ -377,7 +630,12 @@ class SearchService:
             score=result.score,
         )
 
-    def _point_to_message(self, point) -> Message:
+    def _point_to_message(
+        self,
+        point,
+        include_tool_results: bool = True,
+        include_thinking: bool = True,
+    ) -> Message:
         """Convert Qdrant point to Message model."""
         payload = point.payload or {}
         point_id = payload.get("message_id") or str(point.id)
@@ -395,7 +653,11 @@ class SearchService:
         return Message(
             id=point_id,
             role=payload.get("role", "unknown"),
-            content=self._clean_content(payload.get("content", "")),
+            content=self._clean_content(
+                payload.get("content", ""),
+                include_tool_results=include_tool_results,
+                include_thinking=include_thinking,
+            ),
             timestamp=timestamp,
             project=payload.get("project_path", "N/A"),
             conversation_id=payload.get("conversation_id"),

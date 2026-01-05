@@ -20,7 +20,7 @@ import click
 from mcp.server.fastmcp import FastMCP
 from mcp.types import Icon, ToolAnnotations
 
-from .models import ErrorResult, GetResult, SearchResult
+from .models import ConversationSearchResult, ErrorResult, GetResult, SearchResult
 from .search import SearchService
 
 # ==================== Icons (SVG Data URIs) ====================
@@ -86,6 +86,17 @@ Filtering options for kb_search:
 - from_date/to_date: ISO format (YYYY-MM-DD)
 - role: "user" or "assistant"
 - min_score: Relevance threshold (default 0.5)
+
+Content options (both tools):
+- include_tool_results: Include full tool output (default False - shows "[tool result: N chars]")
+- include_thinking: Include thinking blocks (default False - shows "[thinking: N chars]")
+
+By default, responses are lightweight. Set include_tool_results=True or include_thinking=True when you need full content.
+
+Conversation grouping:
+- group_by_conversation: When True, groups results by conversation instead of individual messages
+- Returns conversation summaries with: conversation_id, project, timestamps, message_count, preview, best_score
+- Use this to find relevant conversations, then kb_get(message_id, context_depth=N) to explore
 """
 
 
@@ -141,7 +152,10 @@ def kb_search(
     role: Literal["user", "assistant"] | None = None,
     min_score: float = 0.5,
     boost_recent: bool = True,
-) -> SearchResult | ErrorResult:
+    include_tool_results: bool = False,
+    include_thinking: bool = False,
+    group_by_conversation: bool = False,
+) -> SearchResult | ConversationSearchResult | ErrorResult:
     """Semantic search across Claude Code conversations.
 
     Uses hybrid search (dense + sparse vectors) when available.
@@ -156,9 +170,12 @@ def kb_search(
         role: Filter by role ("user" or "assistant")
         min_score: Minimum relevance score threshold (0.0-1.0, default 0.5)
         boost_recent: Boost recent messages in ranking (default True)
+        include_tool_results: Include full tool result content (default False for smaller responses)
+        include_thinking: Include thinking block content (default False for smaller responses)
+        group_by_conversation: Group results by conversation instead of individual messages (default False)
 
     Returns:
-        SearchResult with matching messages, or ErrorResult on failure.
+        SearchResult with matching messages, ConversationSearchResult if grouped, or ErrorResult on failure.
     """
     return get_service().search(
         query=query,
@@ -169,6 +186,9 @@ def kb_search(
         role=role,
         min_score=min_score,
         boost_recent=boost_recent,
+        include_tool_results=include_tool_results,
+        include_thinking=include_thinking,
+        group_by_conversation=group_by_conversation,
     )
 
 
@@ -179,17 +199,26 @@ def kb_search(
 def kb_get(
     message_id: str,
     context_depth: int = 0,
+    include_tool_results: bool = False,
+    include_thinking: bool = False,
 ) -> GetResult | ErrorResult:
     """Retrieve message by ID with optional thread context.
 
     Args:
         message_id: The message ID to retrieve
         context_depth: If > 0, include ±N surrounding messages from conversation
+        include_tool_results: Include full tool result content (default False for smaller responses)
+        include_thinking: Include thinking block content (default False for smaller responses)
 
     Returns:
         GetResult with message and optional thread context.
     """
-    return get_service().get(message_id, context_depth=context_depth)
+    return get_service().get(
+        message_id,
+        context_depth=context_depth,
+        include_tool_results=include_tool_results,
+        include_thinking=include_thinking,
+    )
 
 
 # ==================== Resources ====================

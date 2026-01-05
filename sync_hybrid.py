@@ -12,7 +12,7 @@ from qdrant_client import models
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
-from claude_kb.core import AsyncQdrantDB, QdrantDB
+from claude_kb.db import AsyncQdrantDB, QdrantDB
 
 console = Console()
 

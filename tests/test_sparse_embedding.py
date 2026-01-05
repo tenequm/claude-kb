@@ -10,7 +10,7 @@ class TestSparseEmbeddingModel:
     @pytest.fixture
     def model(self):
         """Create a sparse embedding model instance."""
-        from claude_kb.core import SparseEmbeddingModel
+        from claude_kb.db import SparseEmbeddingModel
 
         return SparseEmbeddingModel()
 

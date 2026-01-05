@@ -39,6 +39,27 @@ class SearchResult(KBModel):
     results: list[Message]
 
 
+class ConversationSummary(KBModel):
+    """Summary of a conversation matching search criteria."""
+
+    conversation_id: str
+    project: str
+    first_timestamp: datetime
+    last_timestamp: datetime
+    message_count: int
+    preview: str = Field(description="Preview of first matching message content")
+    best_score: float = Field(description="Highest relevance score in conversation")
+
+
+class ConversationSearchResult(KBModel):
+    """Result from search operation with conversation grouping."""
+
+    query: str
+    collection: str
+    count: int
+    conversations: list[ConversationSummary]
+
+
 class GetResult(KBModel):
     """Result from get operation."""
 
