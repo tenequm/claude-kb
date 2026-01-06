@@ -3,6 +3,7 @@
 
 import asyncio
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Add src to path
@@ -144,10 +145,28 @@ async def sync_collections():
                 # Get sparse vector
                 sparse = sparse_embeddings[j]
 
+                # Ensure timestamp_unix is in payload
+                payload = dict(point.payload) if point.payload else {}
+                if "timestamp_unix" not in payload:
+                    timestamp_str = payload.get("timestamp", "")
+                    try:
+                        if "+" in timestamp_str or timestamp_str.endswith("Z"):
+                            ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                        else:
+                            ts = datetime.fromisoformat(timestamp_str)
+                            if ts.tzinfo is None:
+                                ts = ts.replace(tzinfo=UTC)
+                        payload["timestamp_unix"] = int(ts.timestamp())
+                        payload["schema_version"] = 2
+                    except (ValueError, TypeError, AttributeError):
+                        # Use current time as fallback
+                        payload["timestamp_unix"] = int(datetime.now(UTC).timestamp())
+                        payload["schema_version"] = 2
+
                 new_points.append(
                     models.PointStruct(
                         id=point.id,
-                        payload=point.payload,
+                        payload=payload,
                         vector={
                             "dense": dense_vec,
                             "sparse": models.SparseVector(

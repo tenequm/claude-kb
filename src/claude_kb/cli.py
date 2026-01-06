@@ -519,6 +519,161 @@ def migrate(collection, batch_size, dry_run):
 
 
 # =============================================================================
+# BACKFILL-TIMESTAMPS COMMAND
+# =============================================================================
+
+
+@main.command("backfill-timestamps")
+@click.option(
+    "--collection", "-c", default=None, help="Collection to update (auto-detect if omitted)"
+)
+@click.option("--batch-size", default=500, help="Batch size for updates")
+@click.option("--dry-run", is_flag=True, help="Show what would be updated")
+def backfill_timestamps(collection: str | None, batch_size: int, dry_run: bool):
+    """Backfill timestamp_unix field for existing messages.
+
+    This enables server-side date filtering for messages imported
+    before the timestamp_unix field was added.
+
+    Examples:
+
+    \b
+        # Preview changes
+        kb backfill-timestamps --dry-run
+
+    \b
+        # Update all messages
+        kb backfill-timestamps
+
+    \b
+        # Update specific collection
+        kb backfill-timestamps --collection conversations_hybrid
+    """
+    from datetime import UTC, datetime
+
+    from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+
+    console.print("[bold cyan]=== Backfill timestamp_unix ===[/]")
+    console.print()
+
+    config = get_config()
+    db = QdrantDB(config.qdrant_url, config.qdrant_api_key, config.embedding_model)
+
+    # Auto-detect collection
+    if collection is None:
+        try:
+            collections = [c.name for c in db.client.get_collections().collections]
+            collection = (
+                "conversations_hybrid" if "conversations_hybrid" in collections else "conversations"
+            )
+        except Exception:
+            collection = "conversations"
+
+    # Check if collection exists
+    try:
+        info = db.client.get_collection(collection)
+        total_points = info.points_count
+        console.print(f"Collection: {collection} ({total_points:,} points)")
+    except Exception:
+        console.print(f"[red]Collection '{collection}' not found[/]")
+        sys.exit(1)
+
+    if dry_run:
+        console.print(f"[yellow]Dry run: Would scan {total_points:,} points[/]")
+
+    # Ensure the new index exists
+    console.print("Ensuring timestamp_unix index exists...")
+    db.ensure_indices(collection)
+    console.print("[green]✓ Index ready[/]")
+    console.print()
+
+    # Process in batches
+    console.print("Scanning for points missing timestamp_unix...")
+    console.print()
+
+    updated = 0
+    skipped = 0
+    offset = None
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Processing...", total=total_points)
+
+        while True:
+            # Scroll through points
+            results = db.client.scroll(
+                collection_name=collection,
+                limit=batch_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,  # Don't need vectors
+            )
+
+            points, offset = results
+
+            if not points:
+                break
+
+            # Find points missing timestamp_unix
+            for point in points:
+                payload = point.payload or {}
+
+                if "timestamp_unix" in payload:
+                    skipped += 1
+                    progress.update(task, completed=updated + skipped)
+                    continue
+
+                # Parse timestamp and compute unix timestamp
+                timestamp_str = payload.get("timestamp", "")
+                try:
+                    if "+" in timestamp_str or timestamp_str.endswith("Z"):
+                        ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                    else:
+                        ts = datetime.fromisoformat(timestamp_str)
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=UTC)
+
+                    timestamp_unix = int(ts.timestamp())
+
+                    if not dry_run:
+                        # Update payload with timestamp_unix
+                        db.client.set_payload(
+                            collection_name=collection,
+                            payload={
+                                "timestamp_unix": timestamp_unix,
+                                "schema_version": 2,
+                            },
+                            points=[point.id],
+                        )
+
+                    updated += 1
+
+                except (ValueError, TypeError, AttributeError) as e:
+                    logging.warning(f"Failed to parse timestamp for point {point.id}: {e}")
+                    skipped += 1
+
+                progress.update(task, completed=updated + skipped)
+
+            if offset is None:
+                break
+
+    console.print()
+    if dry_run:
+        console.print("[bold yellow]Dry run complete[/]")
+        console.print(f"  Would update: {updated:,} points")
+        console.print(f"  Already have timestamp_unix: {skipped:,} points")
+    else:
+        console.print("[bold green]✓ Backfill complete![/]")
+        console.print(f"  Updated: {updated:,} points")
+        console.print(f"  Skipped (already had timestamp_unix): {skipped:,} points")
+
+
+# =============================================================================
 # MCP COMMAND
 # =============================================================================
 

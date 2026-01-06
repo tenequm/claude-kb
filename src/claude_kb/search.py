@@ -4,7 +4,7 @@ import logging
 import math
 from datetime import UTC, datetime
 
-from qdrant_client.models import FieldCondition, Filter, MatchText, MatchValue
+from qdrant_client.models import FieldCondition, Filter, MatchText, MatchValue, Range
 
 from .config import get_config
 from .db import QdrantDB
@@ -113,16 +113,14 @@ class SearchService:
                     "values": sparse.values.tolist(),
                 }
 
-            # Build Qdrant filter
-            query_filter = self._build_filter(project, role, conversation)
+            # Build Qdrant filter (now includes server-side date filtering via timestamp_unix)
+            query_filter = self._build_filter(project, role, conversation, from_date, to_date)
 
             # For conversation grouping, fetch more results to ensure good coverage
             if group_by_conversation:
                 search_limit = limit * 10  # Fetch more to group effectively
-            elif from_date or to_date:
-                search_limit = limit * 3
             else:
-                search_limit = limit
+                search_limit = limit  # No need to over-fetch, date filtering is server-side
 
             results = self.db.search(
                 query_vector=query_vector.tolist(),
@@ -133,8 +131,8 @@ class SearchService:
                 sparse_vector=sparse_vector,
             )
 
-            # Client-side date filtering
-            if from_date or to_date:
+            # Fallback: client-side date filtering for old data without timestamp_unix
+            if (from_date or to_date) and self._needs_client_side_date_filter(results):
                 results = self._filter_by_date(results, from_date, to_date)
 
             # Recency boosting
@@ -277,8 +275,10 @@ class SearchService:
         project: str | None,
         role: str | None,
         conversation: str | None,
+        from_date: str | None = None,
+        to_date: str | None = None,
     ) -> Filter | None:
-        """Build Qdrant filter from parameters."""
+        """Build Qdrant filter from parameters including date range."""
         filter_conditions = []
 
         # Project filter (partial match using MatchText)
@@ -299,11 +299,68 @@ class SearchService:
                 FieldCondition(key="role", match=MatchValue(value=role.lower()))
             )
 
+        # Date range filter using timestamp_unix (server-side)
+        date_range = self._build_date_range(from_date, to_date)
+        if date_range:
+            filter_conditions.append(FieldCondition(key="timestamp_unix", range=date_range))
+
         # Combine all conditions with AND logic
         if filter_conditions:
             return Filter(must=filter_conditions)
 
         return None
+
+    def _build_date_range(self, from_date: str | None, to_date: str | None) -> Range | None:
+        """Build Range condition for timestamp_unix field.
+
+        Args:
+            from_date: Start date in YYYY-MM-DD format
+            to_date: End date in YYYY-MM-DD format
+
+        Returns:
+            Range object or None if no date filters specified
+        """
+        if not from_date and not to_date:
+            return None
+
+        gte_unix = None
+        lte_unix = None
+
+        if from_date:
+            try:
+                from_dt = datetime.strptime(from_date, "%Y-%m-%d").replace(
+                    hour=0, minute=0, second=0, tzinfo=UTC
+                )
+                gte_unix = int(from_dt.timestamp())
+            except ValueError:
+                logger.warning(f"Invalid from_date format: {from_date}, expected YYYY-MM-DD")
+
+        if to_date:
+            try:
+                to_dt = datetime.strptime(to_date, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59, tzinfo=UTC
+                )
+                lte_unix = int(to_dt.timestamp())
+            except ValueError:
+                logger.warning(f"Invalid to_date format: {to_date}, expected YYYY-MM-DD")
+
+        if gte_unix is None and lte_unix is None:
+            return None
+
+        return Range(gte=gte_unix, lte=lte_unix)
+
+    def _needs_client_side_date_filter(self, results: list) -> bool:
+        """Check if results contain old data without timestamp_unix.
+
+        Returns True if any result is missing timestamp_unix field,
+        indicating we need client-side filtering as fallback.
+        """
+        if not results:
+            return False
+
+        # Sample first result to check for timestamp_unix
+        first_payload = results[0].payload if results else {}
+        return "timestamp_unix" not in first_payload
 
     def _filter_by_date(self, results: list, from_date: str | None, to_date: str | None) -> list:
         """Client-side date filtering (since timestamps are ISO strings)."""

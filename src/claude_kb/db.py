@@ -509,6 +509,7 @@ class QdrantDB:
         indices = [
             ("project_path", PayloadSchemaType.KEYWORD),
             ("timestamp", PayloadSchemaType.DATETIME),
+            ("timestamp_unix", PayloadSchemaType.INTEGER),
             ("role", PayloadSchemaType.KEYWORD),
             ("conversation_id", PayloadSchemaType.KEYWORD),
         ]

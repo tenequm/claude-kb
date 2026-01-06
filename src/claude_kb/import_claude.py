@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from qdrant_client import models
@@ -296,20 +296,28 @@ async def _upload_batch_async(
         batch_ids.append(msg["message_id"])
 
         # Payload
-        timestamp_str = (
-            msg["timestamp"].isoformat()
-            if isinstance(msg["timestamp"], datetime)
-            else str(msg["timestamp"])
-        )
+        msg_timestamp = msg["timestamp"]
+        if isinstance(msg_timestamp, datetime):
+            timestamp_str = msg_timestamp.isoformat()
+            timestamp_unix = int(msg_timestamp.timestamp())
+        else:
+            timestamp_str = str(msg_timestamp)
+            # Try to parse and convert to unix timestamp
+            try:
+                parsed_ts = datetime.fromisoformat(str(msg_timestamp).replace("Z", "+00:00"))
+                timestamp_unix = int(parsed_ts.timestamp())
+            except (ValueError, TypeError):
+                timestamp_unix = int(datetime.now(UTC).timestamp())
 
         batch_payloads.append(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "message_id": msg["message_id"],
                 "conversation_id": msg["conversation_id"],
                 "role": msg["role"],
                 "content": msg["content"],
                 "timestamp": timestamp_str,
+                "timestamp_unix": timestamp_unix,
                 "project_path": msg["project_path"],
                 "cwd": msg["cwd"],
                 "parent_message_id": msg["parent_message_id"],

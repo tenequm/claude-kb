@@ -79,6 +79,46 @@ kb ai
 
 This outputs a token-efficient format that Claude Code and other LLMs can parse to understand how to use the CLI. See [docs/AI_COMMAND_SPEC.md](docs/AI_COMMAND_SPEC.md) for details.
 
+## MCP Server
+
+Claude KB provides an MCP server for integration with Claude Code:
+
+```bash
+# Add to Claude Code
+claude mcp add kb -- uv run kb mcp
+
+# Or run standalone
+uv run kb mcp
+```
+
+## Understanding Search Results
+
+### Score Interpretation
+- **0.9+**: Very high relevance (exact topic match)
+- **0.7-0.9**: Good match (related concepts)
+- **0.5-0.7**: Moderate match (partial relevance)
+- **<0.5**: Filtered out by default
+
+### Why results might be empty
+1. **min_score too high** (default 0.5) - try lowering to 0.3
+2. **Query too specific** - use broader conceptual terms
+3. **Project filter doesn't match** - it's a partial, case-sensitive match
+4. **No data imported** - run `kb status` to verify
+
+### Content visibility
+- All content is indexed and searchable (including tool results and thinking blocks)
+- By default, output shows placeholders: `[tool result: N chars]`, `[thinking: N chars]`
+- Use `include_tool_results=True` or `include_thinking=True` to see full content
+
+### Filter Application Order
+Filters are applied in this sequence:
+1. **Semantic search + min_score** (server-side in Qdrant)
+2. **Metadata filters** (project, role, from_date, to_date) (server-side)
+3. **Recency boost** (if enabled)
+4. **Limit** applied
+
+This means if `min_score` filters out results, date filters never see them.
+
 ## Architecture
 
 - **Simplified structure**: cli.py, core.py, import_claude.py (No manual embedding code!)
