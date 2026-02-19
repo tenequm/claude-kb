@@ -1,7 +1,9 @@
 """Search service layer for claude-kb."""
 
+import json
 import logging
 import math
+import re
 from datetime import UTC, datetime
 
 from qdrant_client.models import FieldCondition, Filter, MatchText, MatchValue, Range
@@ -20,6 +22,14 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+RESTORE_ALLOWED_ROLES = {"user", "assistant"}
+RESTORE_SKIP_BLOCK_TYPES = {"tool_use", "tool_result", "thinking"}
+SYSTEM_REMINDER_RE = re.compile(
+    r"<system-reminder\b[^>]*>.*?</system-reminder>", re.IGNORECASE | re.DOTALL
+)
+SYSTEM_REMINDER_OPEN_RE = re.compile(r"<system-reminder\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
+SORT_FALLBACK_TIMESTAMP = datetime.min.replace(tzinfo=UTC)
 
 
 class SearchService:
@@ -166,24 +176,56 @@ class SearchService:
 
     def get(
         self,
-        message_id: str,
+        message_id: str | None = None,
         context_depth: int = 0,
         include_tool_results: bool = False,
         include_thinking: bool = False,
+        conversation_id: str | None = None,
+        up_to: str | None = None,
+        max_messages: int = 100,
     ) -> GetResult | ErrorResult:
         """
-        Retrieve message by ID with optional thread context.
+        Retrieve message by ID with optional thread context, or restore a conversation.
 
         Args:
-            message_id: Message ID to retrieve
+            message_id: Message ID to retrieve (mutually exclusive with conversation_id)
             context_depth: If > 0, include ±N surrounding messages
-            include_tool_results: Include full tool result content (default False)
-            include_thinking: Include thinking block content (default False)
+            include_tool_results: Include full tool result content (default False).
+                                  Not supported in restore mode.
+            include_thinking: Include thinking block content (default False).
+                              Not supported in restore mode.
+            conversation_id: Conversation ID to restore (mutually exclusive with message_id)
+            up_to: Optional message ID to truncate restored conversation to (inclusive)
+            max_messages: Maximum messages to return in restore mode
 
         Returns:
             GetResult with message and optional thread context.
         """
         try:
+            if message_id is not None and conversation_id is not None:
+                return ErrorResult(
+                    error="message_id and conversation_id are mutually exclusive",
+                    suggestion="Use message_id for single-message/thread retrieval OR "
+                    "conversation_id for restore mode.",
+                )
+
+            if conversation_id:
+                if include_tool_results or include_thinking:
+                    return ErrorResult(
+                        error="include_tool_results/include_thinking are not supported in "
+                        "conversation restore mode",
+                        suggestion="Remove include_tool_results/include_thinking when using "
+                        "conversation_id.",
+                    )
+                return self.get_conversation(
+                    conversation_id=conversation_id,
+                    up_to=up_to,
+                    max_messages=max_messages,
+                )
+
+            if message_id is None:
+                return ErrorResult(error="Either message_id or conversation_id must be provided")
+
             if context_depth > 0:
                 # Get thread context
                 thread_points = self.db.get_thread_context(
@@ -228,6 +270,108 @@ class SearchService:
 
         except Exception as e:
             logger.exception("Get failed")
+            return ErrorResult(error=str(e))
+
+    def get_conversation(
+        self,
+        conversation_id: str,
+        up_to: str | None = None,
+        max_messages: int = 100,
+    ) -> GetResult | ErrorResult:
+        """
+        Restore a conversation transcript for injecting into a new session.
+
+        The transcript is aggressively cleaned to keep only human-readable user/assistant text.
+        """
+        try:
+            if max_messages <= 0:
+                return ErrorResult(error="max_messages must be greater than 0")
+
+            points = self._scroll_conversation_points(conversation_id)
+            if not points:
+                return ErrorResult(error=f"Conversation not found: {conversation_id}")
+
+            points.sort(
+                key=lambda p: self._parse_timestamp(
+                    (p.payload or {}).get("timestamp", ""),
+                    fallback=SORT_FALLBACK_TIMESTAMP,
+                )
+            )
+
+            if up_to:
+                up_to_index = next(
+                    (i for i, point in enumerate(points) if self._point_matches_id(point, up_to)),
+                    None,
+                )
+                if up_to_index is None:
+                    return ErrorResult(
+                        error=f"Message {up_to} not found in conversation {conversation_id}"
+                    )
+                points = points[: up_to_index + 1]
+
+            restored_messages: list[Message] = []
+            for point in points:
+                payload = point.payload or {}
+                role = str(payload.get("role", "")).lower()
+                if role not in RESTORE_ALLOWED_ROLES:
+                    continue
+
+                cleaned_content = self._extract_restore_text(payload.get("content", ""))
+                if not cleaned_content:
+                    continue
+
+                point_id = payload.get("message_id") or str(point.id)
+                restored_messages.append(
+                    Message(
+                        id=point_id,
+                        role=role,
+                        content=f"[{role}] {cleaned_content}",
+                        timestamp=self._parse_timestamp(payload.get("timestamp", "")),
+                        project=payload.get("project_path", "N/A"),
+                        conversation_id=conversation_id,
+                        parent_id=payload.get("parent_message_id"),
+                        score=None,
+                    )
+                )
+
+            if not restored_messages:
+                return ErrorResult(error=f"No user/assistant messages found in {conversation_id}")
+
+            truncated = False
+            if len(restored_messages) > max_messages:
+                restored_messages = restored_messages[-max_messages:]
+                truncated = True
+
+            for index, message in enumerate(restored_messages[:-1]):
+                restored_messages[index].content = f"{message.content}\n\n---"
+
+            first_ts = restored_messages[0].timestamp
+            last_ts = restored_messages[-1].timestamp
+            summary = (
+                f"conversation_id={conversation_id}\n"
+                f"message_count={len(restored_messages)}\n"
+                f"time_range={first_ts.isoformat()} to {last_ts.isoformat()}"
+            )
+            if up_to:
+                summary += f"\nup_to={up_to}"
+            if truncated:
+                summary += f"\ntruncated_to_most_recent={max_messages}"
+
+            return GetResult(
+                message=Message(
+                    id=conversation_id,
+                    role="system",
+                    content=summary,
+                    timestamp=last_ts,
+                    project=restored_messages[0].project,
+                    conversation_id=conversation_id,
+                    parent_id=None,
+                    score=None,
+                ),
+                thread=restored_messages,
+            )
+        except Exception as e:
+            logger.exception("Conversation restore failed")
             return ErrorResult(error=str(e))
 
     def status(self, include_projects: bool = False) -> StatusResult | ErrorResult:
@@ -557,28 +701,7 @@ class SearchService:
     def _get_conversation_message_count(self, conversation_id: str) -> int:
         """Get total message count for a conversation."""
         try:
-            # Use scroll with filter to count messages in conversation
-            count = 0
-            offset = None
-            while True:
-                results = self.db.client.scroll(
-                    collection_name=self.collection,
-                    scroll_filter=Filter(
-                        must=[
-                            FieldCondition(
-                                key="conversation_id", match=MatchValue(value=conversation_id)
-                            )
-                        ]
-                    ),
-                    limit=100,
-                    offset=offset,
-                    with_payload=False,  # Don't need payload, just counting
-                )
-                points, offset = results
-                count += len(points)
-                if offset is None or not points:
-                    break
-            return count
+            return len(self._scroll_conversation_points(conversation_id, with_payload=False))
         except Exception:
             return 0  # Return 0 if we can't count
 
@@ -652,6 +775,105 @@ class SearchService:
 
         return str(content)
 
+    def _extract_restore_text(self, content: str | list | dict) -> str:
+        """Extract only human-readable text for restore mode."""
+        parsed: str | list | dict = content
+        if isinstance(content, str):
+            stripped = content.strip()
+            if stripped.startswith("[") or stripped.startswith("{"):
+                try:
+                    parsed = json.loads(content)
+                except (json.JSONDecodeError, ValueError):
+                    return self._strip_system_reminders(content)
+            else:
+                return self._strip_system_reminders(content)
+
+        text_blocks = self._extract_restore_text_blocks(parsed)
+        cleaned = [self._strip_system_reminders(block) for block in text_blocks]
+        return "\n\n".join(block for block in cleaned if block)
+
+    def _extract_restore_text_blocks(self, content: str | list | dict) -> list[str]:
+        """Extract text blocks while skipping tool/thinking structures."""
+        if isinstance(content, str):
+            return [content]
+
+        if isinstance(content, list):
+            blocks: list[str] = []
+            for item in content:
+                blocks.extend(self._extract_restore_text_blocks(item))
+            return blocks
+
+        if isinstance(content, dict):
+            block_type = str(content.get("type", "")).lower()
+            if block_type in RESTORE_SKIP_BLOCK_TYPES:
+                return []
+            if block_type == "text":
+                text = content.get("text")
+                return [str(text)] if text else []
+            if "content" in content:
+                nested_content = content.get("content")
+                if isinstance(nested_content, str | list | dict):
+                    return self._extract_restore_text_blocks(nested_content)
+            text = content.get("text")
+            if isinstance(text, str):
+                return [text]
+            return []
+
+        return [str(content)]
+
+    def _strip_system_reminders(self, text: str) -> str:
+        """Remove system-reminder tags and normalize spacing."""
+        text = SYSTEM_REMINDER_RE.sub("", text)
+        text = SYSTEM_REMINDER_OPEN_RE.sub("", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    def _scroll_conversation_points(
+        self,
+        conversation_id: str,
+        *,
+        with_payload: bool = True,
+    ) -> list:
+        """Scroll all points for a conversation ID."""
+        points = []
+        offset = None
+        while True:
+            batch, offset = self.db.client.scroll(
+                collection_name=self.collection,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="conversation_id",
+                            match=MatchValue(value=conversation_id),
+                        )
+                    ]
+                ),
+                limit=100,
+                offset=offset,
+                with_payload=with_payload,
+            )
+            if not batch:
+                break
+            points.extend(batch)
+            if offset is None:
+                break
+        return points
+
+    def _point_matches_id(self, point, message_id: str) -> bool:
+        """Check if point ID or payload message_id matches a target ID."""
+        payload = point.payload or {}
+        return str(point.id) == message_id or payload.get("message_id") == message_id
+
+    def _parse_timestamp(self, timestamp_str: str, fallback: datetime | None = None) -> datetime:
+        """Parse ISO timestamp with sane fallback."""
+        try:
+            parsed = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=UTC)
+            return parsed
+        except (ValueError, TypeError, AttributeError):
+            return fallback if fallback is not None else datetime.now(UTC)
+
     def _to_message(
         self,
         result,
@@ -662,16 +884,6 @@ class SearchService:
         payload = result.payload
         point_id = payload.get("message_id") or payload.get("id") or str(result.id)
 
-        # Parse timestamp
-        timestamp_str = payload.get("timestamp", "")
-        try:
-            if "+" in timestamp_str or timestamp_str.endswith("Z"):
-                timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-            else:
-                timestamp = datetime.fromisoformat(timestamp_str)
-        except (ValueError, TypeError):
-            timestamp = datetime.now(UTC)
-
         return Message(
             id=point_id,
             role=payload.get("role", "unknown"),
@@ -680,7 +892,7 @@ class SearchService:
                 include_tool_results=include_tool_results,
                 include_thinking=include_thinking,
             ),
-            timestamp=timestamp,
+            timestamp=self._parse_timestamp(payload.get("timestamp", "")),
             project=payload.get("project_path", "N/A"),
             conversation_id=payload.get("conversation_id"),
             parent_id=payload.get("parent_message_id"),
@@ -697,16 +909,6 @@ class SearchService:
         payload = point.payload or {}
         point_id = payload.get("message_id") or str(point.id)
 
-        # Parse timestamp
-        timestamp_str = payload.get("timestamp", "")
-        try:
-            if "+" in timestamp_str or timestamp_str.endswith("Z"):
-                timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-            else:
-                timestamp = datetime.fromisoformat(timestamp_str)
-        except (ValueError, TypeError):
-            timestamp = datetime.now(UTC)
-
         return Message(
             id=point_id,
             role=payload.get("role", "unknown"),
@@ -715,7 +917,7 @@ class SearchService:
                 include_tool_results=include_tool_results,
                 include_thinking=include_thinking,
             ),
-            timestamp=timestamp,
+            timestamp=self._parse_timestamp(payload.get("timestamp", "")),
             project=payload.get("project_path", "N/A"),
             conversation_id=payload.get("conversation_id"),
             parent_id=payload.get("parent_message_id"),

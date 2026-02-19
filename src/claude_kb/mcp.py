@@ -77,17 +77,18 @@ SERVER_INSTRUCTIONS = """Knowledge base for Claude Code conversation history.
 
 Tools:
 - kb_search: Semantic search across conversations (hybrid dense+sparse vectors)
-- kb_get: Retrieve message by ID, optionally with thread context
+- kb_get: Retrieve message by ID/context, or restore a full conversation transcript
 
-Workflow: kb_search → kb_get(id) for full content or kb_get(id, context_depth=N) for thread
+Workflow: kb_search → kb_get(id) for full content or kb_get(id, context_depth=N) for thread or kb_get(conversation_id=X) to restore conversation
 
 IMPORTANT - Query vs Filters:
 - query: WHAT to search for (concepts, topics, keywords). Keep semantic, don't include project names.
-- project/from_date/role: WHERE/WHEN to search. These are filters applied after semantic matching.
+- project/conversation_id/from_date/role: WHERE/WHEN to search. These are filters applied after semantic matching.
 - Example: query="error handling", project="my-app" (NOT query="error handling my-app")
 
 Filtering options for kb_search:
 - project: Partial match on project path (use instead of putting project in query)
+- conversation_id: Exact match filter for a specific conversation/session
 - from_date/to_date: ISO format (YYYY-MM-DD), server-side filtering via timestamp_unix
 - role: "user" or "assistant"
 - min_score: Relevance threshold (default 0.5, range 0.0-1.0)
@@ -122,6 +123,17 @@ Conversation grouping:
 - group_by_conversation: When True, groups results by conversation instead of individual messages
 - Returns conversation summaries with: conversation_id, project, timestamps, message_count, preview, best_score
 - Use this to find relevant conversations, then kb_get(message_id, context_depth=N) to explore
+
+Conversation restore workflow:
+1. kb_search("topic I discussed before", group_by_conversation=True)
+2. Pick conversation_id and relevant message_id from results
+3. kb_get(conversation_id="...", up_to="message-id")
+4. Use kb_get(conversation_id="...") to load full conversation when needed
+
+Restore mode notes:
+- message_id and conversation_id are mutually exclusive
+- conversation restore is aggressively cleaned and always strips tool_results/thinking
+- include_tool_results/include_thinking are only for single-message/thread retrieval
 """
 
 
@@ -172,6 +184,7 @@ def kb_search(
     query: str,
     limit: int = 10,
     project: str | None = None,
+    conversation_id: str | None = None,
     from_date: str | None = None,
     to_date: str | None = None,
     role: Literal["user", "assistant"] | None = None,
@@ -196,7 +209,7 @@ def kb_search(
 
     Filter application order:
     1. Semantic search with min_score threshold (server-side, Qdrant)
-    2. Metadata filters: project, role, from_date, to_date (server-side)
+    2. Metadata filters: project, conversation_id, role, from_date, to_date (server-side)
     3. Recency boost (if enabled)
     4. Limit applied
 
@@ -206,6 +219,7 @@ def kb_search(
         limit: Maximum number of results (default 10)
         project: Filter by project path (partial match). Use this to limit search scope,
                  not the query parameter.
+        conversation_id: Filter by exact conversation/session ID.
         from_date: Filter from date (ISO format: YYYY-MM-DD). Server-side filtering.
         to_date: Filter to date (ISO format: YYYY-MM-DD). Server-side filtering.
         role: Filter by role ("user" or "assistant")
@@ -227,6 +241,7 @@ def kb_search(
         query=query,
         limit=limit,
         project=project,
+        conversation=conversation_id,
         from_date=from_date,
         to_date=to_date,
         role=role,
@@ -243,32 +258,72 @@ def kb_search(
     icons=[ICON_GET],
 )
 def kb_get(
-    message_id: str,
+    message_id: str | None = None,
+    conversation_id: str | None = None,
+    up_to: str | None = None,
     context_depth: int = 0,
+    max_messages: int = 100,
     include_tool_results: bool = False,
     include_thinking: bool = False,
 ) -> GetResult | ErrorResult:
-    """Retrieve message by ID with optional thread context.
+    """Retrieve message by ID with optional thread context, OR restore a full conversation.
 
-    Use this after kb_search to get full message content or surrounding conversation context.
+    Modes:
+    1. Single message: kb_get(message_id="...")
+    2. Message with context: kb_get(message_id="...", context_depth=5)
+    3. Full conversation: kb_get(conversation_id="...")
+    4. Conversation up to a point: kb_get(conversation_id="...", up_to="message-id")
+
+    Mode 3-4 is for restoring past conversation context into the current session.
+    Use kb_search to find the conversation_id and message_id first, then kb_get to load it.
+    message_id and conversation_id are mutually exclusive.
+
+    Restore workflow:
+      kb_search("topic I discussed before", group_by_conversation=True)
+      → finds conversation_id and a relevant message_id
+      kb_get(conversation_id="...", up_to="message-id")
+      → returns the conversation transcript up to that point
 
     Args:
         message_id: The message ID to retrieve (from kb_search results)
+        conversation_id: Restore mode: conversation/session ID to load.
+        up_to: Restore mode: include messages up to and including this message ID.
         context_depth: If > 0, include ±N surrounding messages from the same conversation,
                        ordered chronologically. Use to understand conversation flow.
+        max_messages: Restore mode safety cap (default 100), applied after up_to truncation.
         include_tool_results: Include full tool result content (default False - shows "[tool result: N chars]").
-                              Set True to see actual tool outputs.
+                              Set True to see actual tool outputs for single-message/thread mode.
+                              Not supported in restore mode.
         include_thinking: Include thinking block content (default False - shows "[thinking: N chars]").
-                          Set True to see Claude's reasoning process.
+                          Set True to see Claude's reasoning process for single-message/thread mode.
+                          Not supported in restore mode.
 
     Returns:
         GetResult with message and optional thread context, or ErrorResult if message not found.
     """
+    if message_id is None and conversation_id is None:
+        return ErrorResult(error="Either message_id or conversation_id must be provided")
+    if message_id is not None and conversation_id is not None:
+        return ErrorResult(
+            error="message_id and conversation_id are mutually exclusive",
+            suggestion="Use message_id for single-message/thread retrieval OR "
+            "conversation_id for restore mode.",
+        )
+    if conversation_id is not None and (include_tool_results or include_thinking):
+        return ErrorResult(
+            error="include_tool_results/include_thinking are not supported in conversation "
+            "restore mode",
+            suggestion="Remove include_tool_results/include_thinking when using conversation_id.",
+        )
+
     return get_service().get(
-        message_id,
+        message_id=message_id,
         context_depth=context_depth,
         include_tool_results=include_tool_results,
         include_thinking=include_thinking,
+        conversation_id=conversation_id,
+        up_to=up_to,
+        max_messages=max_messages,
     )
 
 
@@ -292,6 +347,7 @@ def get_schema() -> str:
 
 ## Search Filters
 - project: Partial match (e.g., "claude-kb" matches "/Users/x/Projects/claude-kb")
+- conversation_id: Exact match for a specific conversation/session
 - from_date / to_date: ISO format YYYY-MM-DD (server-side filtering via timestamp_unix)
 - role: Exact match "user" or "assistant"
 - min_score: 0.0-1.0 relevance threshold (default 0.5, applied server-side BEFORE date filters)
@@ -309,6 +365,15 @@ All message content is indexed and searchable, including:
 
 Set include_tool_results=True or include_thinking=True to see full content in output.
 
+## Conversation Restore (kb_get)
+- Single message: kb_get(message_id="...")
+- Message + context: kb_get(message_id="...", context_depth=5)
+- Full restore: kb_get(conversation_id="...")
+- Restore up to point: kb_get(conversation_id="...", up_to="message-id")
+- Safety cap: max_messages defaults to 100 to avoid oversized transcripts
+- message_id and conversation_id are mutually exclusive
+- include_tool_results/include_thinking are not supported in restore mode
+
 ## Troubleshooting Empty Results
 1. Lower min_score to 0.3 for broader exploration
 2. Use broader search terms (semantic search works on concepts, not exact keywords)
@@ -317,9 +382,12 @@ Set include_tool_results=True or include_thinking=True to see full content in ou
 
 ## Examples
 - Find error discussions: kb_search("error handling", project="my-app")
+- Search only one conversation: kb_search("retry logic", conversation_id="abc123")
 - Broader search: kb_search("implementation", min_score=0.3)
 - Recent assistant responses: kb_search("implementation", role="assistant", from_date="2024-12-01")
 - Get message with context: kb_get("message-id", context_depth=3)
+- Restore full conversation: kb_get(conversation_id="abc123")
+- Restore conversation up to a point: kb_get(conversation_id="abc123", up_to="message-id")
 """
 
 

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-02-19
+
+### Added
+- Conversation restore mode in `kb_get` using `conversation_id` with optional `up_to` and `max_messages`
+- `conversation_id` filter in MCP `kb_search` tool arguments
+- Test coverage for `SearchService` restore/cleaning helpers and edge-case validation
+
+### Changed
+- `kb_get` now treats `message_id` and `conversation_id` as mutually exclusive
+- Restore mode now fails fast if `include_tool_results`/`include_thinking` are passed (instead of silently ignoring)
+- Conversation restore ordering now sorts by parsed timestamps instead of raw timestamp strings
+- Unified conversation scroll logic for restore and message counting
+
+## [0.5.0] - 2026-01-06
+
+### Added
+- Server-side date filtering via `timestamp_unix` across search and MCP flows
+- `timestamp_unix` support in import/sync pipelines for efficient time-range filtering
+
+### Changed
+- Date filters now run in Qdrant payload filtering instead of client-side fallback for new data
+- Documentation updated to clarify server-side date filter behavior
+
+## [0.4.0] - 2026-01-05
+
+### Added
+- Output content filtering controls (`include_tool_results`, `include_thinking`)
+- Conversation-grouped search mode (`group_by_conversation`) with conversation summaries
+
+### Changed
+- Search and MCP output now defaults to lightweight content with optional expanded blocks
+- Search docs and schemas updated for conversation-level exploration workflow
+
 ## [0.3.1] - 2025-12-16
 
 ### Changed
@@ -86,7 +119,10 @@ This creates a new `conversations_hybrid` collection with both dense and sparse 
 - Docker Compose setup for local Qdrant
 - Pre-commit hooks with secret detection
 
-[Unreleased]: https://github.com/tenequm/claude-kb/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/tenequm/claude-kb/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/tenequm/claude-kb/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/tenequm/claude-kb/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/tenequm/claude-kb/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/tenequm/claude-kb/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/tenequm/claude-kb/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/tenequm/claude-kb/compare/v0.1.1...v0.2.0
