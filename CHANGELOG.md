@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-03-18
+
+### Added
+- Compact response mode for MCP tools (~29% token reduction, up to 86% on assistant messages)
+- `_shorten_project()` helper for consistent project path shortening
+- `_is_thinking_only()` helper to detect and filter placeholder-only search results
+- 8 new unit tests for compact mode behavior
+
+### Changed
+- MCP `kb_search` and `kb_get` now strip non-essential metadata: query echo, collection name, parent_id, path prefixes, excess score precision
+- Single text content blocks are unwrapped from JSON array wrapper in MCP responses
+- `tool_use` blocks reduced to `{type, name}` when `include_tool_results=False`
+- Thinking-only messages are filtered from MCP search results (with 1.5x over-fetch to compensate)
+- `SearchResult` and `ConversationSearchResult` envelope fields (`query`, `collection`) are now optional
+- CLI output is unchanged (all optimizations are behind `compact=True`, which only MCP uses)
+
 ## [0.6.0] - 2026-02-19
 
 ### Added
@@ -119,7 +135,8 @@ This creates a new `conversations_hybrid` collection with both dense and sparse 
 - Docker Compose setup for local Qdrant
 - Pre-commit hooks with secret detection
 
-[Unreleased]: https://github.com/tenequm/claude-kb/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/tenequm/claude-kb/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/tenequm/claude-kb/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/tenequm/claude-kb/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/tenequm/claude-kb/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/tenequm/claude-kb/compare/v0.3.1...v0.4.0
