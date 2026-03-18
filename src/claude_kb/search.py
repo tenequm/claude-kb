@@ -642,6 +642,10 @@ class SearchService:
                 if preview is not None:
                     break
 
+            # In compact mode, skip conversations with no usable preview
+            if compact and preview is None:
+                continue
+
             # Get project from first message
             project = messages[0].payload.get("project_path", "N/A")
 
