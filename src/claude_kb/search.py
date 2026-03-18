@@ -638,7 +638,7 @@ class SearchService:
             # Get preview from first matching message that has text content
             preview = None
             for m in messages:
-                preview = self._extract_preview(m.payload.get("content", ""), max_length=200)
+                preview = self._extract_preview(m.payload.get("content", ""), max_length=2000)
                 if preview is not None:
                     break
 
