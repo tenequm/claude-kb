@@ -635,9 +635,12 @@ class SearchService:
             # Get best score (highest relevance)
             best_score = max(m.score for m in messages)
 
-            # Get preview from first matching message content
-            first_content = messages[0].payload.get("content", "")
-            preview = self._extract_preview(first_content, max_length=200)
+            # Get preview from first matching message that has text content
+            preview = None
+            for m in messages:
+                preview = self._extract_preview(m.payload.get("content", ""), max_length=200)
+                if preview is not None:
+                    break
 
             # Get project from first message
             project = messages[0].payload.get("project_path", "N/A")
@@ -675,8 +678,8 @@ class SearchService:
             conversations=summaries,
         )
 
-    def _extract_preview(self, content: str | list | dict, max_length: int = 200) -> str:
-        """Extract a text preview from message content."""
+    def _extract_preview(self, content: str | list | dict, max_length: int = 200) -> str | None:
+        """Extract a text preview from message content. Returns None if no text found."""
 
         # Handle structured content (list of content blocks)
         if isinstance(content, list):
@@ -685,17 +688,13 @@ class SearchService:
                     text = item.get("text", "")
                     if text:
                         return text[:max_length] + ("..." if len(text) > max_length else "")
-            # No text block found, return summary
-            return f"[{len(content)} content blocks]"
+            return None
 
         if isinstance(content, dict):
-            # Try to get text from dict
             if "text" in content:
                 text = content["text"]
                 return str(text)[:max_length] + ("..." if len(str(text)) > max_length else "")
-            # Return type indicator if available
-            content_type = content.get("type", "unknown")
-            return f"[{content_type} content]"
+            return None
 
         # Plain string
         if isinstance(content, str):
@@ -703,7 +702,6 @@ class SearchService:
             if content.strip().startswith("[") or content.strip().startswith("{"):
                 try:
                     parsed = json.loads(content)
-                    # Extract from parsed structure without recursion
                     if isinstance(parsed, list):
                         for item in parsed:
                             if isinstance(item, dict) and item.get("type") == "text":
@@ -712,7 +710,7 @@ class SearchService:
                                     return text[:max_length] + (
                                         "..." if len(text) > max_length else ""
                                     )
-                        return f"[{len(parsed)} content blocks]"
+                        return None
                     elif isinstance(parsed, dict) and "text" in parsed:
                         text = parsed["text"]
                         return str(text)[:max_length] + (

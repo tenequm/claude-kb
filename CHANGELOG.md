@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-03-18
+
+### Fixed
+- Grouped search previews now iterate messages to find actual text instead of showing useless `[N content blocks]` for tool-only messages
+- `_extract_preview()` returns `None` instead of bracket-string fallbacks, eliminating false previews
+- `ConversationSummary.preview` is now optional - dropped from compact output when no text preview is available
+
 ## [0.7.0] - 2026-03-18
 
 ### Added

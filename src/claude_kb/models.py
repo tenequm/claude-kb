@@ -47,7 +47,7 @@ class ConversationSummary(KBModel):
     first_timestamp: datetime
     last_timestamp: datetime
     message_count: int
-    preview: str = Field(description="Preview of first matching message content")
+    preview: str | None = Field(None, description="Preview of first matching message content")
     best_score: float = Field(description="Highest relevance score in conversation")
 
 
