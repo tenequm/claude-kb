@@ -16,6 +16,7 @@ class FakePoint:
 
     id: str
     payload: dict | None
+    score: float | None = None
 
 
 class FakeClient:
@@ -68,19 +69,22 @@ def make_point(
     timestamp: str,
     content: str | list | dict,
     conversation_id: str = "conv-1",
+    project_path: str = "/tmp/project",
+    parent_message_id: str | None = None,
+    score: float | None = None,
 ) -> FakePoint:
     """Build a fake point payload."""
-    return FakePoint(
-        id=point_id,
-        payload={
-            "message_id": point_id,
-            "role": role,
-            "timestamp": timestamp,
-            "content": content,
-            "project_path": "/tmp/project",
-            "conversation_id": conversation_id,
-        },
-    )
+    payload = {
+        "message_id": point_id,
+        "role": role,
+        "timestamp": timestamp,
+        "content": content,
+        "project_path": project_path,
+        "conversation_id": conversation_id,
+    }
+    if parent_message_id is not None:
+        payload["parent_message_id"] = parent_message_id
+    return FakePoint(id=point_id, payload=payload, score=score)
 
 
 def make_service(points: list[FakePoint]) -> SearchService:
@@ -222,3 +226,164 @@ def test_scroll_helpers_paginate_and_share_logic():
     loaded = service._scroll_conversation_points("conv-1", with_payload=True)
     assert len(loaded) == 205
     assert loaded[0].payload is not None
+
+
+# ==================== Compact mode tests ====================
+
+
+def test_compact_strips_parent_id_and_shortens_project():
+    """Compact mode should drop parent_id and shorten project to basename."""
+    point = make_point(
+        "m1",
+        role="user",
+        timestamp="2026-01-01T10:00:00Z",
+        content="hello",
+        project_path="/Users/tenequm/Projects/claude-kb",
+        parent_message_id="m0",
+        score=0.85,
+    )
+    service = make_service([])
+    msg = service._to_message(point, compact=True)
+
+    assert msg.parent_id is None
+    assert msg.project == "claude-kb"
+
+
+def test_compact_rounds_score():
+    """Compact mode should round score to 2 decimal places."""
+    point = make_point(
+        "m1",
+        role="assistant",
+        timestamp="2026-01-01T10:00:00Z",
+        content="response",
+        score=0.8260917916427055,
+    )
+    service = make_service([])
+    msg = service._to_message(point, compact=True)
+
+    assert msg.score == 0.83
+
+
+def test_compact_unwraps_single_text_block():
+    """Compact mode should unwrap single text blocks to plain text."""
+    service = make_service([])
+    content = json.dumps([{"type": "text", "text": "hello world"}])
+    result = service._clean_content(content, compact=True)
+
+    assert result == "hello world"
+
+
+def test_compact_keeps_multi_block_as_compact_json():
+    """Compact mode should use compact JSON for multi-block content."""
+    service = make_service([])
+    content = json.dumps(
+        [
+            {"type": "text", "text": "first"},
+            {"type": "text", "text": "second"},
+        ]
+    )
+    result = service._clean_content(content, compact=True)
+
+    assert "\n" not in result
+    assert "  " not in result
+    parsed = json.loads(result)
+    assert len(parsed) == 2
+
+
+def test_compact_strips_tool_use_blocks():
+    """tool_use blocks should be reduced to type+name when include_tool_results=False."""
+    service = make_service([])
+    content = json.dumps(
+        [
+            {"type": "text", "text": "searching"},
+            {
+                "type": "tool_use",
+                "id": "toolu_01Eh3cbqQaYMTcq2fKUxZupu",  # pragma: allowlist secret
+                "name": "mcp__kb__kb_search",
+                "input": {"query": "test", "limit": 10},
+                "caller": {"type": "direct"},
+            },
+        ]
+    )
+    result = service._clean_content(content, include_tool_results=False, compact=True)
+    parsed = json.loads(result)
+
+    tool_block = parsed[1]
+    assert tool_block == {"type": "tool_use", "name": "mcp__kb__kb_search"}
+    assert "id" not in tool_block
+    assert "input" not in tool_block
+    assert "caller" not in tool_block
+
+
+def test_is_thinking_only_helper():
+    """_is_thinking_only should detect thinking-only content patterns."""
+    assert SearchService._is_thinking_only("[thinking: 1234 chars]")
+    assert SearchService._is_thinking_only(
+        json.dumps([{"type": "thinking", "thinking": "[thinking: 500 chars]"}])
+    )
+    assert not SearchService._is_thinking_only("actual useful content")
+    assert not SearchService._is_thinking_only(
+        json.dumps(
+            [
+                {"type": "thinking", "thinking": "..."},
+                {"type": "text", "text": "useful"},
+            ]
+        )
+    )
+    assert not SearchService._is_thinking_only("")
+
+
+def test_compact_restore_deduplicates_fields():
+    """Compact restore should drop conversation_id and parent_id from thread messages."""
+    points = [
+        make_point(
+            "m1",
+            role="user",
+            timestamp="2026-01-01T10:00:00Z",
+            content="hello",
+            parent_message_id="m0",
+            project_path="/Users/tenequm/Projects/myproject",
+        ),
+        make_point(
+            "m2",
+            role="assistant",
+            timestamp="2026-01-01T10:00:01Z",
+            content="world",
+            parent_message_id="m1",
+            project_path="/Users/tenequm/Projects/myproject",
+        ),
+    ]
+    service = make_service(points)
+
+    result = service.get_conversation("conv-1", compact=True)
+
+    assert isinstance(result, GetResult)
+    assert result.thread is not None
+    for msg in result.thread:
+        assert msg.conversation_id is None
+        assert msg.parent_id is None
+        assert msg.project == "myproject"
+
+    # Summary message should still have conversation_id
+    assert result.message.conversation_id == "conv-1"
+
+
+def test_non_compact_preserves_all_fields():
+    """Default (non-compact) mode should preserve all metadata fields."""
+    point = make_point(
+        "m1",
+        role="user",
+        timestamp="2026-01-01T10:00:00Z",
+        content=json.dumps([{"type": "text", "text": "hello"}]),
+        project_path="/Users/tenequm/Projects/claude-kb",
+        parent_message_id="m0",
+        score=0.8260917916427055,
+    )
+    service = make_service([])
+    msg = service._to_message(point, compact=False)
+
+    assert msg.parent_id == "m0"
+    assert msg.project == "/Users/tenequm/Projects/claude-kb"
+    assert msg.score == 0.8260917916427055
+    # Non-compact keeps JSON wrapping
+    assert '"type": "text"' in msg.content

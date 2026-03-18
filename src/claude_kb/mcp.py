@@ -250,6 +250,7 @@ def kb_search(
         include_tool_results=include_tool_results,
         include_thinking=include_thinking,
         group_by_conversation=group_by_conversation,
+        compact=True,
     )
 
 
@@ -324,6 +325,7 @@ def kb_get(
         conversation_id=conversation_id,
         up_to=up_to,
         max_messages=max_messages,
+        compact=True,
     )
 
 

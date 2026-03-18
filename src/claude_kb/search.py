@@ -3,6 +3,7 @@
 import json
 import logging
 import math
+import os
 import re
 from datetime import UTC, datetime
 
@@ -77,6 +78,7 @@ class SearchService:
         include_tool_results: bool = False,
         include_thinking: bool = False,
         group_by_conversation: bool = False,
+        compact: bool = False,
     ) -> SearchResult | ConversationSearchResult | ErrorResult:
         """
         Semantic search with filtering and recency boosting.
@@ -129,6 +131,8 @@ class SearchService:
             # For conversation grouping, fetch more results to ensure good coverage
             if group_by_conversation:
                 search_limit = limit * 10  # Fetch more to group effectively
+            elif compact:
+                search_limit = int(limit * 1.5)  # Over-fetch to compensate for thinking-only skips
             else:
                 search_limit = limit  # No need to over-fetch, date filtering is server-side
 
@@ -151,21 +155,28 @@ class SearchService:
 
             # Group by conversation if requested
             if group_by_conversation:
-                return self._group_by_conversation(query, results, limit)
+                return self._group_by_conversation(query, results, limit, compact=compact)
 
             # Convert to Pydantic models and limit
-            messages = [
-                self._to_message(
-                    r,
-                    include_tool_results=include_tool_results,
-                    include_thinking=include_thinking,
+            skip_thinking = compact and not include_thinking
+            messages = []
+            for r in results:
+                if len(messages) >= limit:
+                    break
+                if skip_thinking and self._is_thinking_only(r.payload.get("content", "")):
+                    continue
+                messages.append(
+                    self._to_message(
+                        r,
+                        include_tool_results=include_tool_results,
+                        include_thinking=include_thinking,
+                        compact=compact,
+                    )
                 )
-                for r in results[:limit]
-            ]
 
             return SearchResult(
-                query=query,
-                collection=self.collection,
+                query=None if compact else query,
+                collection=None if compact else self.collection,
                 count=len(messages),
                 results=messages,
             )
@@ -183,6 +194,7 @@ class SearchService:
         conversation_id: str | None = None,
         up_to: str | None = None,
         max_messages: int = 100,
+        compact: bool = False,
     ) -> GetResult | ErrorResult:
         """
         Retrieve message by ID with optional thread context, or restore a conversation.
@@ -197,6 +209,7 @@ class SearchService:
             conversation_id: Conversation ID to restore (mutually exclusive with message_id)
             up_to: Optional message ID to truncate restored conversation to (inclusive)
             max_messages: Maximum messages to return in restore mode
+            compact: If True, strip non-essential metadata for compact MCP responses
 
         Returns:
             GetResult with message and optional thread context.
@@ -221,6 +234,7 @@ class SearchService:
                     conversation_id=conversation_id,
                     up_to=up_to,
                     max_messages=max_messages,
+                    compact=compact,
                 )
 
             if message_id is None:
@@ -242,6 +256,7 @@ class SearchService:
                         point,
                         include_tool_results=include_tool_results,
                         include_thinking=include_thinking,
+                        compact=compact,
                     )
                     if msg.id == message_id or str(point.id) == message_id:
                         target = msg
@@ -265,6 +280,7 @@ class SearchService:
                         point,
                         include_tool_results=include_tool_results,
                         include_thinking=include_thinking,
+                        compact=compact,
                     )
                 )
 
@@ -277,6 +293,7 @@ class SearchService:
         conversation_id: str,
         up_to: str | None = None,
         max_messages: int = 100,
+        compact: bool = False,
     ) -> GetResult | ErrorResult:
         """
         Restore a conversation transcript for injecting into a new session.
@@ -321,15 +338,19 @@ class SearchService:
                     continue
 
                 point_id = payload.get("message_id") or str(point.id)
+                project = payload.get("project_path", "N/A")
+                if compact:
+                    project = self._shorten_project(project)
+
                 restored_messages.append(
                     Message(
                         id=point_id,
                         role=role,
                         content=f"[{role}] {cleaned_content}",
                         timestamp=self._parse_timestamp(payload.get("timestamp", "")),
-                        project=payload.get("project_path", "N/A"),
-                        conversation_id=conversation_id,
-                        parent_id=payload.get("parent_message_id"),
+                        project=project,
+                        conversation_id=None if compact else conversation_id,
+                        parent_id=None if compact else payload.get("parent_message_id"),
                         score=None,
                     )
                 )
@@ -347,6 +368,7 @@ class SearchService:
 
             first_ts = restored_messages[0].timestamp
             last_ts = restored_messages[-1].timestamp
+            summary_project = restored_messages[0].project
             summary = (
                 f"conversation_id={conversation_id}\n"
                 f"message_count={len(restored_messages)}\n"
@@ -363,7 +385,7 @@ class SearchService:
                     role="system",
                     content=summary,
                     timestamp=last_ts,
-                    project=restored_messages[0].project,
+                    project=summary_project,
                     conversation_id=conversation_id,
                     parent_id=None,
                     score=None,
@@ -565,7 +587,7 @@ class SearchService:
         return [BoostedResult(r, score) for score, r in boosted]
 
     def _group_by_conversation(
-        self, query: str, results: list, limit: int
+        self, query: str, results: list, limit: int, compact: bool = False
     ) -> ConversationSearchResult:
         """
         Group search results by conversation_id.
@@ -574,6 +596,7 @@ class SearchService:
             query: Original search query
             results: Search results to group
             limit: Maximum number of conversations to return
+            compact: If True, shorten project paths and round scores
 
         Returns:
             ConversationSearchResult with conversation summaries
@@ -619,6 +642,10 @@ class SearchService:
             # Get project from first message
             project = messages[0].payload.get("project_path", "N/A")
 
+            if compact:
+                project = self._shorten_project(project)
+                best_score = round(best_score, 2)
+
             # Get total message count for this conversation from DB
             # (messages list only contains matches, not full conversation)
             message_count = self._get_conversation_message_count(conv_id)
@@ -642,15 +669,14 @@ class SearchService:
         summaries = summaries[:limit]
 
         return ConversationSearchResult(
-            query=query,
-            collection=self.collection,
+            query=None if compact else query,
+            collection=None if compact else self.collection,
             count=len(summaries),
             conversations=summaries,
         )
 
     def _extract_preview(self, content: str | list | dict, max_length: int = 200) -> str:
         """Extract a text preview from message content."""
-        import json
 
         # Handle structured content (list of content blocks)
         if isinstance(content, list):
@@ -710,6 +736,7 @@ class SearchService:
         content: str | list | dict,
         include_tool_results: bool = True,
         include_thinking: bool = True,
+        compact: bool = False,
     ) -> str:
         """
         Clean content by removing signatures and optionally filtering heavy content.
@@ -718,11 +745,11 @@ class SearchService:
             content: Raw message content (string, list, or dict)
             include_tool_results: If False, replace tool_result content with summary
             include_thinking: If False, replace thinking block content with summary
+            compact: If True, unwrap single text blocks and use compact JSON
 
         Returns:
             Cleaned content string (JSON for structured content)
         """
-        import json
 
         def clean_item(obj):
             """Recursively clean content items."""
@@ -739,6 +766,10 @@ class SearchService:
                         "tool_use_id": obj.get("tool_use_id"),
                         "content": f"[tool result: {content_len} chars]",
                     }
+
+                # Handle tool_use blocks
+                if obj.get("type") == "tool_use" and not include_tool_results:
+                    return {"type": "tool_use", "name": obj.get("name", "unknown")}
 
                 # Handle thinking blocks
                 if obj.get("type") == "thinking" and not include_thinking:
@@ -757,13 +788,23 @@ class SearchService:
 
             return obj
 
+        def _serialize_cleaned(cleaned) -> str:
+            """Serialize cleaned content, with optional compaction."""
+            if compact:
+                if isinstance(cleaned, list) and len(cleaned) == 1:
+                    item = cleaned[0]
+                    if isinstance(item, dict) and item.get("type") == "text" and "text" in item:
+                        return item["text"]
+                return json.dumps(cleaned, separators=(",", ":"))
+            return json.dumps(cleaned, indent=2)
+
         # Parse JSON string if needed
         if isinstance(content, str):
             if content.strip().startswith("[") or content.strip().startswith("{"):
                 try:
                     parsed = json.loads(content)
                     cleaned = clean_item(parsed)
-                    return json.dumps(cleaned, indent=2)
+                    return _serialize_cleaned(cleaned)
                 except (json.JSONDecodeError, ValueError):
                     return content
             return content
@@ -771,7 +812,7 @@ class SearchService:
         # Handle list/dict directly
         if isinstance(content, list | dict):
             cleaned = clean_item(content)
-            return json.dumps(cleaned, indent=2)
+            return _serialize_cleaned(cleaned)
 
         return str(content)
 
@@ -874,15 +915,44 @@ class SearchService:
         except (ValueError, TypeError, AttributeError):
             return fallback if fallback is not None else datetime.now(UTC)
 
+    @staticmethod
+    def _shorten_project(project: str) -> str:
+        """Extract just the project name from a full path."""
+        return os.path.basename(project) if project != "N/A" else project
+
+    @staticmethod
+    def _is_thinking_only(content: str) -> bool:
+        """Check if content is only a thinking placeholder with no useful text."""
+        stripped = content.strip()
+        if re.match(r"^\[thinking: \d+ chars\]$", stripped):
+            return True
+        if stripped.startswith("[") or stripped.startswith("{"):
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, list) and parsed:
+                    return all(
+                        isinstance(item, dict) and item.get("type") == "thinking" for item in parsed
+                    )
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return False
+
     def _to_message(
         self,
         result,
         include_tool_results: bool = True,
         include_thinking: bool = True,
+        compact: bool = False,
     ) -> Message:
         """Convert search result to Message model."""
         payload = result.payload
         point_id = payload.get("message_id") or payload.get("id") or str(result.id)
+        project = payload.get("project_path", "N/A")
+        score = result.score
+
+        if compact:
+            project = self._shorten_project(project)
+            score = round(score, 2) if score is not None else None
 
         return Message(
             id=point_id,
@@ -891,12 +961,13 @@ class SearchService:
                 payload.get("content", ""),
                 include_tool_results=include_tool_results,
                 include_thinking=include_thinking,
+                compact=compact,
             ),
             timestamp=self._parse_timestamp(payload.get("timestamp", "")),
-            project=payload.get("project_path", "N/A"),
+            project=project,
             conversation_id=payload.get("conversation_id"),
-            parent_id=payload.get("parent_message_id"),
-            score=result.score,
+            parent_id=None if compact else payload.get("parent_message_id"),
+            score=score,
         )
 
     def _point_to_message(
@@ -904,10 +975,15 @@ class SearchService:
         point,
         include_tool_results: bool = True,
         include_thinking: bool = True,
+        compact: bool = False,
     ) -> Message:
         """Convert Qdrant point to Message model."""
         payload = point.payload or {}
         point_id = payload.get("message_id") or str(point.id)
+        project = payload.get("project_path", "N/A")
+
+        if compact:
+            project = self._shorten_project(project)
 
         return Message(
             id=point_id,
@@ -916,10 +992,11 @@ class SearchService:
                 payload.get("content", ""),
                 include_tool_results=include_tool_results,
                 include_thinking=include_thinking,
+                compact=compact,
             ),
             timestamp=self._parse_timestamp(payload.get("timestamp", "")),
-            project=payload.get("project_path", "N/A"),
+            project=project,
             conversation_id=payload.get("conversation_id"),
-            parent_id=payload.get("parent_message_id"),
+            parent_id=None if compact else payload.get("parent_message_id"),
             score=None,  # No score for direct retrieval
         )

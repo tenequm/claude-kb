@@ -33,8 +33,8 @@ class Message(KBModel):
 class SearchResult(KBModel):
     """Result from search operation."""
 
-    query: str
-    collection: str
+    query: str | None = None
+    collection: str | None = None
     count: int
     results: list[Message]
 
@@ -54,8 +54,8 @@ class ConversationSummary(KBModel):
 class ConversationSearchResult(KBModel):
     """Result from search operation with conversation grouping."""
 
-    query: str
-    collection: str
+    query: str | None = None
+    collection: str | None = None
     count: int
     conversations: list[ConversationSummary]
 
