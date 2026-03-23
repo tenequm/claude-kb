@@ -1,162 +1,89 @@
 # Claude KB
 
-Universal knowledge base with Qdrant for Claude Code integration.
+Semantic search across your Claude Code conversation history, powered by Qdrant.
 
-Provides semantic search across:
-- Claude Code conversation history
-- Personal knowledge entities
-- Documents and research notes
+## Setup
 
-## Installation
+### 1. Install
 
-### Run directly (no install)
-```bash
-uvx claude-kb@latest status
-```
-
-### Install as a tool
 ```bash
 uv tool install claude-kb
-kb status
+```
 
-# Update to latest version
+### 2. Start Qdrant
+
+```bash
+docker compose up -d
+```
+
+### 3. Initialize and import
+
+```bash
+kb init
+kb import claude-code-chats
+```
+
+### 4. Add MCP server to Claude Code
+
+```bash
+claude mcp add -s user kb -- kb mcp
+```
+
+That's it. Claude Code now has access to `kb_search` and `kb_get` tools for searching your conversation history.
+
+### Update
+
+```bash
 uv tool upgrade claude-kb
 ```
 
-### Development
-```bash
-git clone https://github.com/tenequm/claude-kb.git
-cd claude-kb
-uv sync --extra dev
-```
-
-## Features
-
-- **Hybrid search**: Dense (semantic) + sparse (keyword) vectors with RRF fusion
-- **Claude Code import**: Automatically import your conversation history
-- **LLM-optimized CLI**: `kb ai` command provides token-efficient schema for AI agents
-- **FastEmbed/ONNX**: Fast local embeddings with bge-base-en-v1.5 (768 dim, ~1s search time)
-- **Self-hosted**: Run locally with Docker Compose
-
-## Quick Start
+To check current version:
 
 ```bash
-# Start Qdrant
-docker compose up -d
-
-# Initialize collections
-kb init
-
-# Import your Claude Code conversations
-kb import claude-code-chats
-
-# Search!
-kb search "qdrant vector databases"
+kb --version
 ```
 
-## Usage
-
-### Search conversations
-```bash
-kb search "your query"
-kb search "query" --collection conversations --limit 20
-```
-
-### Get specific message
-```bash
-kb get msg_abc123
-```
-
-### Check status
-```bash
-kb status
-```
-
-### LLM-optimized schema (for AI agents)
-```bash
-kb ai
-```
-
-This outputs a token-efficient format that Claude Code and other LLMs can parse to understand how to use the CLI. See [docs/AI_COMMAND_SPEC.md](docs/AI_COMMAND_SPEC.md) for details.
-
-## MCP Server
-
-Claude KB provides an MCP server for integration with Claude Code:
+## CLI Usage
 
 ```bash
-# Add to Claude Code
-claude mcp add kb -- uv run kb mcp
-
-# Or run standalone
-uv run kb mcp
+kb search "your query"                    # semantic search
+kb search "query" --limit 20             # with options
+kb get <message-id>                       # retrieve specific message
+kb get-thread <message-id>                # message with context
+kb status                                 # check collections and stats
+kb ai                                     # LLM-optimized schema
 ```
-
-## Understanding Search Results
-
-### Score Interpretation
-- **0.9+**: Very high relevance (exact topic match)
-- **0.7-0.9**: Good match (related concepts)
-- **0.5-0.7**: Moderate match (partial relevance)
-- **<0.5**: Filtered out by default
-
-### Why results might be empty
-1. **min_score too high** (default 0.5) - try lowering to 0.3
-2. **Query too specific** - use broader conceptual terms
-3. **Project filter doesn't match** - it's a partial, case-sensitive match
-4. **No data imported** - run `kb status` to verify
-
-### Content visibility
-- All content is indexed and searchable (including tool results and thinking blocks)
-- By default, output shows placeholders: `[tool result: N chars]`, `[thinking: N chars]`
-- Use `include_tool_results=True` or `include_thinking=True` to see full content
-
-### Filter Application Order
-Filters are applied in this sequence:
-1. **Semantic search + min_score** (server-side in Qdrant)
-2. **Metadata filters** (project, role, from_date, to_date) (server-side)
-3. **Recency boost** (if enabled)
-4. **Limit** applied
-
-This means if `min_score` filters out results, date filters never see them.
-
-## Architecture
-
-- **Simplified structure**: cli.py, core.py, import_claude.py (No manual embedding code!)
-- **Qdrant collections**: conversations, entities, documents
-- **Embedding**: QdrantClient built-in FastEmbed with BAAI/bge-base-en-v1.5 (768 dim, ONNX-optimized)
-- **Search time**: ~1 second total (0.7s model load + 0.3s search)
-- **Output format**: Structured plaintext (NOT JSON) optimized for LLM parsing
 
 ## Configuration
 
-Create `.env` file (see `.env.example`):
+Set `QDRANT_URL` if Qdrant is not on localhost:
+
+```bash
+export QDRANT_URL=http://your-host:6333
+```
+
+Or create a `.env` file:
+
 ```bash
 QDRANT_URL=http://localhost:6333
-EMBEDDING_MODEL=BAAI/bge-base-en-v1.5  # FastEmbed model (768 dims, ~1s search)
-
-# Alternative models:
-# EMBEDDING_MODEL=BAAI/bge-small-en-v1.5  # Faster (384 dims, ~0.5s)
-# EMBEDDING_MODEL=BAAI/bge-large-en-v1.5  # Higher quality (1024 dims, ~2s)
+EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
 ```
+
+## Search Tips
+
+- **Score 0.9+**: exact topic match, **0.7-0.9**: related, **0.5-0.7**: partial, **<0.5**: filtered
+- Lower `min_score` to 0.3 for broader exploration
+- Use `project` parameter to filter by project (partial match), not the query
+- By default, thinking and tool_result content shows as `[thinking: N chars]` placeholders - use `include_thinking=True` / `include_tool_results=True` for full content
 
 ## Development
 
 ```bash
-# Format + lint
-ruff format . && ruff check . --fix
-
-# Test (manual for now)
-uv run kb --help
+git clone https://github.com/tenequm/claude-kb.git
+cd claude-kb
+uv sync --extra dev
+just check  # lint + format
 ```
-
-## Roadmap
-
-- [ ] Streaming search (background mode)
-- [ ] Entity management (`kb add entity`)
-- [ ] Document import (`kb add document`)
-- [ ] Relationship traversal (`kb related`)
-- [ ] Full hybrid search (sparse vectors)
-- [ ] Token-aware context window truncation
 
 ## License
 
